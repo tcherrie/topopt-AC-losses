@@ -41,7 +41,6 @@ from ngsolve.webgui import Draw
 from copy import copy
 from utils.physics import current_density
 from utils.physics import electric_field
-from ngsolve.comp import IntegrationRuleSpace 
 
 #%% Projected gradient descent
 
@@ -450,7 +449,8 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
 
 
 def dd_joule_losses(results : dict,          
-                    slot    : str   = "slot.*"
+                    slot    : str   = "slot.*",
+                    bonus_intorder : int = 3
                     ) -> ngs.SymbolicBFI :
     """
     Compute the directional derivative of Joule losses.
@@ -468,6 +468,9 @@ def dd_joule_losses(results : dict,
     slot : str, optional
         Subdomain selection pattern defining where the Joule losses are
         evaluated (typically stator slot regions).
+        
+    bonus_intorder : int, optional
+        Bonus integration order.
 
     Returns
     -------
@@ -492,15 +495,16 @@ def dd_joule_losses(results : dict,
     sigma = results["info"]["conductivity"] + 1e-300
 
     # Returns the directional derivative of losses w.r.t the state
-    return ngs.InnerProduct(j, j_) / sigma * ngs.dx(slot)
+    return ngs.InnerProduct(j, j_) / sigma * ngs.dx(slot, bonus_intorder = bonus_intorder)
 
 
 def partiald_joule_losses(results :     dict, 
                           adjoint :     dict, 
                           test , # symbolic test function, representing the pertubation direction
                           wrt     :     str ="conductivity", 
-                          slot    :     str = "slot.*"
-                          ) -> ngs.BilinearForm :
+                          slot    :     str = "slot.*",
+                          bonus_intorder : int = 3,
+                          ) -> ngs.LinearForm:
     """
     Compute the partial Fréchet derivative of Joule losses.
 
@@ -526,6 +530,9 @@ def partiald_joule_losses(results :     dict,
 
     slot : str, optional
         Subdomain pattern where the derivative is evaluated.
+        
+    bonus_intorder : int, optional
+        Bonus integration order for conductivity terms.
 
     Returns
     -------
@@ -538,17 +545,10 @@ def partiald_joule_losses(results :     dict,
     - High-order quadrature is used for improved accuracy.
     """
 
-    # Mesh extraction
-    mesh = results["info"]["fes"].mesh
-
     # Initialize weak form
     df = ngs.LinearForm(test.space)
 
     if wrt.lower() == "conductivity":
-
-        # Quadrature order adapted to FE space order
-        quadratureOrder = 2 * results["solution"]["a"].space.globalorder
-        intrules = IntegrationRuleSpace(mesh, order=quadratureOrder).GetIntegrationRules()
 
         # Electric field from primal solution
         E = -electric_field(results)
@@ -561,10 +561,10 @@ def partiald_joule_losses(results :     dict,
             df += ngs.InnerProduct(
                 pa + adjoint["solution"]["e"][bundle],
                 E
-                ).real * test * ngs.dx(bundle, intrules=intrules)
+                ).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
 
         # Bulk slot contribution
-        df += (ngs.InnerProduct(E, E)).real / 2 * test * ngs.dx(slot, intrules=intrules)
+        df += (ngs.InnerProduct(E, E)).real / 2 * test * ngs.dx(slot, bonus_intorder = bonus_intorder)
 
     # elif wrt.lower() == "resistivity":
     #     TODO
@@ -575,7 +575,10 @@ def partiald_joule_losses(results :     dict,
 def d_joule_losses(results  : dict, 
                    val      : ngs.GridFunction, 
                    adjoint  : dict = None, 
-                   wrt      : str  ="conductivity"):
+                   wrt      : str  ="conductivity",
+                   slot    : str = "slot.*",
+                   bonus_intorder : int = 3
+                   ) -> ngs.LinearForm:
     """
     Compute the total Fréchet derivative of Joule losses.
 
@@ -600,6 +603,9 @@ def d_joule_losses(results  : dict,
         Parameter with respect to which the derivative is computed.
         Currently supports:
         - "conductivity" (default)
+        
+    bonus_intorder : int, optional
+        Bonus integration order for conductivity terms.
 
     Returns
     -------
@@ -625,10 +631,12 @@ def d_joule_losses(results  : dict,
         test = val.space.TestFunction()
 
         # Assemble partial derivative contribution
-        df = partiald_joule_losses(results,
-                                   adjoint,
-                                   test,
-                                   wrt="conductivity")
+        df = partiald_joule_losses(results=results,
+                                   adjoint=adjoint,
+                                   test=test,
+                                   wrt="conductivity",
+                                   slot=slot,
+                                   bonus_intorder = bonus_intorder)
 
     # elif wrt.lower() == "resistivity":
     #     TODO

@@ -167,7 +167,8 @@ def solve_magnetoharmonic(
     conductivity: ngs.GridFunction | ngs.CoefficientFunction | float = 6e7,  # conductivity
     Kinv=None,  # optional precomputed inverse system matrix
     solver: str = "pardiso",  # linear solver type
-    verbose: int = 0,
+    bonus_intorder : int = 3,       # bonus intorder for conductivity and magnetizationterms
+    verbose: int = 0,  # for controlling print statements
     taskmanager: bool = True, # for paralelizing assembly process
     ) -> dict:
     """
@@ -206,6 +207,9 @@ def solve_magnetoharmonic(
     solver : str, optional
         Direct solver backend used for matrix inversion (default: "pardiso").
 
+    bonus_intorder : int, optional
+        Bonus integration order for conductivity terms.
+
     verbose : int, optional
         Verbosity level for assembly and solve progress.
 
@@ -226,7 +230,8 @@ def solve_magnetoharmonic(
     Notes
     -----
     - The formulation imposes total current via Lagrange multiplier
-    - If Kinv is provided, the factorization step is skipped.
+    - If Kinv is provided, the factorization step is skipped which 
+      accelerates the computation a lot (e.g, for different current excitations)
     """
 
     jw = 1j * 2 * ngs.pi * frequency
@@ -241,7 +246,7 @@ def solve_magnetoharmonic(
 
     # Normalize supplied currents by bundle volume
     Jcplx = {
-        bundle: supply[bundle] / ngs.Integrate(ngs.CF(1), mesh.Materials(bundle))
+        bundle: supply[bundle] / ngs.Integrate(1, mesh.Materials(bundle))
         for bundle in bundles
     }
 
@@ -273,8 +278,8 @@ def solve_magnetoharmonic(
 
         # Eddy-current + constraint coupling in each bundle
         for bundle in bundles:
-            bf += a_ * conductivity * (jw * a + e[bundle]) * ngs.dx(bundle)
-            bf += e_[bundle] * conductivity * (jw * a + e[bundle]) * ngs.dx(bundle)
+            bf += a_ * conductivity * (jw * a + e[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            bf += e_[bundle] * conductivity * (jw * a + e[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
 
         # Assemble matrix
         if taskmanager:
@@ -301,7 +306,7 @@ def solve_magnetoharmonic(
     if verbose >= 1:
         print("Assemble right hand side... ", end="")
 
-    lf = Curl(a_) * magnetization * ngs.dx
+    lf = Curl(a_) * magnetization * ngs.dx(bonus_intorder = bonus_intorder)
 
     for bundle in bundles:
         lf += -e_[bundle] * Jcplx[bundle] * ngs.dx(bundle)
@@ -477,7 +482,7 @@ def joule_losses(results : dict) -> float:
     mesh = results["info"]["fes"].mesh
 
     # Quadrature order adapted to solution polynomial order
-    order = 4 * results["solution"]["a"].space.globalorder
+    order = 2 * results["solution"]["a"].space.globalorder + 1
 
     # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
     P = ngs.Integrate(
@@ -553,7 +558,6 @@ def average_torque(results : dict,
     - Uses Arkkio's method:
         T = (L π / (μ₀ S)) ∫ (B · (Q B)) dΩ
         see this paper: https://arxiv.org/pdf/2511.07217
-    - B is obtained as Curl(A).
     - S is the airgap surface area.
     """
 
@@ -563,7 +567,7 @@ def average_torque(results : dict,
     mesh = results["info"]["fes"].mesh
 
     # Airgap normalization area
-    S = ngs.Integrate(1, mesh.Materials(airgap), order=order)
+    S = ngs.Integrate(1, mesh.Materials(airgap))
 
     # Magnetic flux density
     b = Curl(results["solution"]["a"])
@@ -573,4 +577,4 @@ def average_torque(results : dict,
     # Arkkio torque formula
     integrand = ngs.InnerProduct(b, (matrix_arkkio() * b))
     factor = L * ngs.pi / (S * mu0) 
-    return factor * ngs.Integrate(integrand , mesh.Materials(airgap)).real
+    return factor * ngs.Integrate(integrand , mesh.Materials(airgap), order=order).real
