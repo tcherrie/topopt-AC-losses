@@ -1,5 +1,7 @@
 # Topopt-AC-losses
 
+[![GitHub license](https://img.shields.io/github/license/tcherrie/topopt-AC-losses)](https://github.com/tcherrie/topopt-AC-losses) [![GitHub release](https://img.shields.io/github/release/tcherrie/topopt-AC-losses.svg)](https://github.com/tcherrie/topopt-AC-losses/releases/) [![GitHub stars](https://img.shields.io/github/stars/tcherrie/topopt-AC-losses)](https://github.com/tcherrie/topopt-AC-losses/stargazers)
+
 Parametric and topology optimization of armature conductors' in electrical machines to minimize AC losses.
 
 ![alt text](scenes/cover.png)
@@ -33,8 +35,16 @@ After that, you should be able to run the scripts on your computer.
 ### Run the scripts
 Execute one of the notebooks in your favorite IDE within your newly created `myenv` environment, starting for instance from [0_index](0_index.ipynb).
 
+## 3) Papers using this repository
 
-## 2) Contents of the repository
+> Cherrière T., Pons A., Krebs G., Mercier A., Benmamas L. & Küttler S.  (2026)
+> ***Reducing AC losses in Halbach electrical machines with density topology optimization of winding***  
+> *International Conference on Electrical Machines (ICEM 2026), Madeiras, September 2026*
+> paper DOI: *to be published*
+> Code version:  [![DOI](https://zenodo.org/badge/1240891081.svg)](https://doi.org/10.5281/zenodo.20457486)
+
+
+## 4) Contents of the repository
 
 ```
 .
@@ -65,7 +75,7 @@ Execute one of the notebooks in your favorite IDE within your newly created `mye
 └── LICENSE # GNU LGPL 2.1 or any later version
 ```
 
-## 3) License
+## 5) License
 
 Copyright (C) Théodore CHERRIERE (theodore.cherriere@centralesupelec.fr), Alexis PONS (alexis.pons@centralesupelec.fr), Guillaume KREBS (guillaume.krebs@centralesupelec.fr), Adrien MERCIER (adrien.mercier@centralesupelec.fr), Loucif BENMAMAS (loucif.benmamas@safrangroup.com), Sulivan KÜTTLER (sulivan.kuttler@safrangroup.com)
 
