@@ -2,9 +2,11 @@
 
 Parametric and topology optimization of armature conductors' in electrical machines to minimize AC losses.
 
+![alt text](scenes/cover.png)
+
 ## 1) Quickstart
 
-First, download the repo and follow the installation instruction in 2. 
+First, download the repo and follow the installation instruction in Section 2. 
 Then, go to the [index](0_index.ipynb) and run the Jupyter Notebooks.
 
 ## 2) Installation
