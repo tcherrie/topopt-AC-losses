@@ -5,6 +5,7 @@ Provide utilities to generate the machine geometry and mesh.
 Functions defined here:
 - plot_points               (debug)
 - plot_lines                (debug)
+- mask                      (helper for vizualization)
 - find_tangent_intersection (helper)
 - machine_mesh              (main function)
 - slot_mesh                 (main function)
@@ -190,6 +191,52 @@ def plot_lines(pnts: list,
 
 
 #%% Helper
+
+def mask(
+    space_or_mesh: ngs.FESpace | ngs.comp.Mesh,
+    region: str = ".*",
+    ) -> ngs.GridFunction | ngs.CoefficientFunction:
+    """
+    Create a mask identifying active regions of a mesh or finite element space.
+
+    If a mesh is provided, the mask is equal to 1 in materials matching
+    ``region`` and ``NaN`` elsewhere. If a finite element space is provided,
+    the mask is equal to 1 where the space has degrees of freedom and ``NaN``
+    elsewhere. The resulting mask is convenient for visualizing domains while
+    hiding inactive regions.
+
+    Parameters
+    ----------
+    space_or_mesh : ngs.FESpace or ngs.comp.Mesh
+        Finite element space or mesh from which to build the mask.
+
+    region : str, optional
+        Regular expression selecting material regions when a mesh is provided.
+        Ignored if a finite element space is given. Default is ``".*"``.
+
+    Returns
+    -------
+    ngs.GridFunction or ngs.CoefficientFunction
+        Mask equal to 1 in active regions and ``NaN`` elsewhere.
+    """
+    if type(space_or_mesh) is ngs.comp.Mesh:
+        # Material-based mask on the mesh
+        gfu = space_or_mesh.MaterialCF({region: 1}, default=np.nan)
+    else:
+        # Identify the support of the finite element space
+        gfu_ref = ngs.GridFunction(space_or_mesh)
+        gfu_ref.Set(
+            ngs.CF(tuple([1 / ngs.sqrt(gfu_ref.dim) for i in range(gfu_ref.dim)]))
+        )
+
+        # Compute the norm to obtain a scalar mask
+        gfu = ngs.GridFunction(ngs.L2(space_or_mesh.mesh))
+        gfu.Set(ngs.Norm(gfu_ref))
+
+        # Replace inactive regions by NaN for cleaner visualization
+        gfu.vec.data.FV().NumPy()[gfu.vec.FV().NumPy() == 0] = np.nan
+
+    return gfu
 
 def find_tangent_intersection(p1:       tuple[float, float],
                               p2:       tuple[float, float],
@@ -1016,6 +1063,8 @@ def machine_mesh(# Primitives
     # Create and return the mesh
 
     return ngs.Mesh(geo.GenerateMesh(maxh = max([hAirOut, hRotor, hBundle, hShoe, hAirgap, hStator, hCorner])))
+
+
 
 #%% Tests
 

@@ -26,7 +26,7 @@ __copyright__ = "Copyright 2026, CentraleSupélec, SAFRAN"
 __credits__ = ["Théodore Cherrière", "Alexis Pons", "Guillaume Krebs",
                     "Adrien Mercier", "Loucif Benmamas", "Sulivan Küttler"]
 __license__ = "GNU LGPL"
-__version__ = "0.1"
+__version__ = "0.11"
 __maintainer__ = "Théodore Cherrière"
 __email__ = "theodore.cherriere@centralesupelec.fr"
 __status__ = "Development"
@@ -39,8 +39,8 @@ import ngsolve as ngs
 
 from ngsolve.webgui import Draw
 from copy import copy
-from utils.physics import current_density
-from utils.physics import electric_field
+from utils.physics import current_density, electric_field
+from utils.geometry import mask
 
 #%% Projected gradient descent
 
@@ -176,7 +176,8 @@ def gradient_descent(state :        callable,           # takes x0 ngs.GridFunct
     surface = ngs.Integrate(characteristic_function, x0.space.mesh)
 
     if draw:
-        scene = Draw(x_list[-1], x0.space.mesh,
+        mask_x = mask(x0.space)
+        scene = Draw(x_list[-1]*mask_x, x0.space.mesh,
                          min = x_min, max = x_max,
                          settings = {"Objects" : {"Wireframe" : False}, 
                                      "Colormap" : {"ncolors" : 32}})
@@ -233,7 +234,7 @@ def gradient_descent(state :        callable,           # takes x0 ngs.GridFunct
         x_list.append(project(x_test, x_min, x_max))
 
         if draw:
-            scene.Redraw(x_list[-1], x0.space.mesh,
+            scene.Redraw(x_list[-1]*mask_x, x0.space.mesh,
                          min = x_min, max = x_max,
                          settings = {"Objects" : {"Wireframe" : False}, 
                                      "Colormap" : {"ncolors" : 32}})
