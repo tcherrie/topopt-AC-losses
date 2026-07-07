@@ -1,6 +1,6 @@
 # Topopt-AC-losses
 
-[![GitHub license](https://img.shields.io/github/license/tcherrie/topopt-AC-losses)](https://github.com/tcherrie/topopt-AC-losses) [![GitHub release](https://img.shields.io/github/release/tcherrie/topopt-AC-losses.svg)](https://github.com/tcherrie/topopt-AC-losses/releases/) [![GitHub stars](https://img.shields.io/github/stars/tcherrie/topopt-AC-losses)](https://github.com/tcherrie/topopt-AC-losses/stargazers)
+[![GitHub license](https://img.shields.io/github/license/tcherrie/topopt-AC-losses)](https://github.com/tcherrie/topopt-AC-losses) [![GitHub release](https://img.shields.io/github/release/tcherrie/topopt-AC-losses.svg)](https://github.com/tcherrie/topopt-AC-losses/releases/) [![GitHub stars](https://img.shields.io/github/stars/tcherrie/topopt-AC-losses)](https://github.com/tcherrie/topopt-AC-losses/stargazers) [![DOI](https://zenodo.org/badge/1240891081.svg)](https://doi.org/10.5281/zenodo.21249567)
 
 Parametric and topology optimization of armature conductors' in electrical machines to minimize AC losses.
 
@@ -43,12 +43,13 @@ Execute one of the notebooks in your favorite IDE within your newly created `mye
 > ***Mitigating AC losses in electrical machines with topology optimization***  
 > *23rd EUROPT Conference on Advances in Continuous Optimization (EUROPT 2026), Linz, July 2026*
 > (no proceedings)
+> Code version: [10.5281/zenodo.21249567](https://doi.org/10.5281/zenodo.21249567)
 
 > Cherrière T., Pons A., Krebs G., Mercier A., Benmamas L. & Küttler S.  (2026)
 > ***Reducing AC losses in Halbach electrical machines with density topology optimization of winding***  
 > *International Conference on Electrical Machines (ICEM 2026), Madeiras, September 2026*
 > paper DOI: *to be published*
-> Code version:  [![DOI](https://zenodo.org/badge/1240891081.svg)](https://doi.org/10.5281/zenodo.20457486)
+> Code version:  [10.5281/zenodo.20457486](https://doi.org/10.5281/zenodo.20457486)
 
 
 ## 4) Contents of the repository
