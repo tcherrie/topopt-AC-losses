@@ -37,6 +37,13 @@ Execute one of the notebooks in your favorite IDE within your newly created `mye
 
 ## 3) Papers using this repository
 
+### International conferences
+
+> Cherrière T.  (2026)
+> ***Mitigating AC losses in electrical machines with topology optimization***  
+> *23rd EUROPT Conference on Advances in Continuous Optimization (EUROPT 2026), Linz, July 2026*
+> (no proceedings)
+
 > Cherrière T., Pons A., Krebs G., Mercier A., Benmamas L. & Küttler S.  (2026)
 > ***Reducing AC losses in Halbach electrical machines with density topology optimization of winding***  
 > *International Conference on Electrical Machines (ICEM 2026), Madeiras, September 2026*
@@ -65,6 +72,8 @@ Execute one of the notebooks in your favorite IDE within your newly created `mye
 ├── 3_single_material_optimization.ipynb
 ├── 4_multi_material_optimization.ipynb
 ├── 5_topology_optimization.ipynb
+├── 6_slot_model.ipynb
+├── 7_topology_optimization_slot.ipynb
 │
 | # Installation and instructions
 ├── requirements.txt # numpy, matplotlib, ngsolve, scipy
