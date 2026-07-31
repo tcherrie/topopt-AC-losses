@@ -469,6 +469,8 @@ def solve_magnetoharmonic(
             "supply": supply,
             "conductivity": conductivity,
             "Kinv": Kinv,
+            "K" : K,
+            "F": -res,
             "solver": solver,
             "walltime" : {"fes": t_fes, 
                           "assembly": t_assembly, 
