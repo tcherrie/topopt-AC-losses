@@ -26,12 +26,17 @@ __copyright__ = "Copyright 2026, CentraleSupélec, SAFRAN"
 __credits__ = ["Théodore Cherrière", "Alexis Pons", "Guillaume Krebs",
                     "Adrien Mercier", "Loucif Benmamas", "Sulivan Küttler"]
 __license__ = "GNU LGPL"
-__version__ = "0.11"
+__version__ = "0.2"
 __maintainer__ = "Théodore Cherrière"
 __email__ = "theodore.cherriere@centralesupelec.fr"
 __status__ = "Development"
 
 #%% Import
+
+from tabnanny import verbose
+
+import scipy.sparse as sp
+from time import time
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -367,7 +372,8 @@ def plot_taylor_test(H :                np.ndarray,
 #%% Derivative computation
 
 def solve_adjoint(results   : dict,    # structured output from physics.solve_magnetoharmonic
-                  df        : callable # function (input "results", output ngsolve symbolic expression)
+                  df        : callable,# function (input "results", output ngsolve symbolic expression)
+                  verbose : int = 0    # verbosity level
                   ) -> dict:
     """
     Solve the adjoint problem associated with given finite-element state 
@@ -389,6 +395,9 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
     df : callable
         Function that maps `results` to a ngsolve symbolic expression representing 
         the adjoint right-hand side.
+   
+    verbose : int, optional
+        Verbosity level for logging information during the adjoint solve process.
 
     Returns
     -------
@@ -409,6 +418,9 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
       or transpose operators.
     """
 
+    if verbose >= 1:
+        print(f"-- START ADJOINT SOLVER --")
+
     # Assemble adjoint right-hand side
     F = ngs.LinearForm(df(results))
 
@@ -416,20 +428,38 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
     sol = ngs.GridFunction(fes)
 
     # Assemble system vector
+    if verbose >= 1: print("Assembling adjoint right-hand side... ", end = "")
+    t0 = time()
     F = F.Assemble().vec
+    t1 = time()
+    if verbose >= 1: print(f"done in {(t1-t0)*1000 : .0f} ms")
 
     # Retrieve precomputed inverse system operator
+    if verbose >= 1: print("Solving adjoint system... ", end = "")
     Kinv = results["info"]["Kinv"]
 
     # Solve adjoint system (complex vs real handling)
     if sol.is_complex:
-        sol.vec.data = -1 * Kinv.H * F
+        if type(Kinv) != sp.linalg.SuperLU:
+            sol.vec.data = -1 * Kinv.H * F
+        else:
+            spsol = Kinv.solve(F.FV().NumPy()[fes.FreeDofs()], 'H')
+            sol.vec.data.FV().NumPy()[fes.FreeDofs()] = -spsol
     else:
-        sol.vec.data = -1 * Kinv.T * F
+        if type(Kinv) != sp.linalg.SuperLU:
+            sol.vec.data = -1 * Kinv.T * F
+        else:
+            spsol = Kinv.solve(F.FV().NumPy()[fes.FreeDofs()], 'T')
+            sol.vec.data.FV().NumPy()[fes.FreeDofs()] = -spsol
+
+    t2 = time()
+    if verbose >= 1: print(f"done in{(t2-t1)*1000 : .0f} ms")
 
     # ------------------------------------------------------------
     # Package adjoint solution into structured output
     # ------------------------------------------------------------
+
+    if verbose >= 1: print("Packaging adjoint solution... ", end = "")
     adjoint = {"solution": {}}
 
     # Main (air) component
@@ -445,6 +475,10 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
     adjoint["test"] = results["test"]
     adjoint["bundles"] = results["bundles"]
     adjoint["info"] = results["info"]
+    t3 = time()
+    if verbose >= 1: 
+        print(f"done in {(t3-t2)*1000 : .0f} ms")
+        print(f"-- END ADJOINT SOLVER --")
 
     return adjoint
 

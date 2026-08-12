@@ -38,6 +38,8 @@ __status__ = "Development"
 import ngsolve as ngs
 import numpy as np
 from time import time
+import scipy.sparse as sp
+
 
 #%% Helpers
 
@@ -166,7 +168,7 @@ def solve_magnetoharmonic(
     reluctivity: ngs.GridFunction | ngs.CoefficientFunction,  # magnetic reluctivity
     magnetization: ngs.GridFunction | ngs.CoefficientFunction,  # complex magnetization
     frequency: float,   # electrical frequency
-    supply: dict|ngs.CoefficientFunction, # supply of electrical conductors
+    supply: dict, # supply of electrical conductors
     conductivity: ngs.GridFunction | ngs.CoefficientFunction | float = 6e7,    # conductivity
     Kinv=None,  # optional precomputed inverse system matrix
     solver: str = "pardiso",  # linear solver type
@@ -209,10 +211,9 @@ def solve_magnetoharmonic(
     frequency : float
         Electrical excitation frequency [Hz].
 
-    supply : dict or ngs.CoefficientFunction
-        Electrical supply of the conducting bundles. When provided as a
-        dictionary, keys correspond to conductor bundle names and values to the
-        imposed complex currents [A].
+    supply : dict
+        Electrical supply of the conducting bundles. Keys correspond to 
+        conductor bundle names and values to the imposed complex currents [A].
 
     conductivity : float or ngs.GridFunction or ngs.CoefficientFunction, optional
         Electrical conductivity distribution.
@@ -299,6 +300,7 @@ def solve_magnetoharmonic(
     
     if verbose >= 1:
         print(f"-- START MAGNETOHARMONIC SOLVER --")
+        print(f"Solver : {solver.lower()}")
         
     t0 = time()
     jw = 1j * 2 * ngs.pi * frequency
@@ -383,11 +385,17 @@ def solve_magnetoharmonic(
         if verbose >= 1:
             txt = txtref
             print(txtref, end="")
-        
     
         tic = time()
         if (Kinv is None):
-            Kinv = K.Inverse(fes.FreeDofs(), inverse=solver)
+            if solver.lower() != "superlu":
+                Kinv = K.Inverse(fes.FreeDofs(), inverse=solver)
+            else:
+                rows,cols,vals = K.COO()
+                Ksp =  sp.csc_matrix((vals,(rows,cols)))
+                Ksp = Ksp[fes.FreeDofs(),:][:,fes.FreeDofs()]
+                Kinv = sp.linalg.splu(Ksp)          
+                            
         t_decomposition = time() - tic
         
         if verbose >= 1:
@@ -423,14 +431,18 @@ def solve_magnetoharmonic(
         print(txt, *[""]*(len(txtref) - len(txt)), end="")
     tic = time()
     sol = ngs.GridFunction(fes)
-    
+    res = sol.vec.CreateVector()
     if fix1dof:
         sol.vec.data[ind] = a_dirichlet.vec[ind]
-        res = K*sol.vec - F
+        res.data = K*sol.vec - F
     else:
-        res = -F
+        res.data =  -F
 
-    sol.vec.data -= Kinv * res
+    if type(Kinv) != sp.linalg.SuperLU:
+        sol.vec.data -= Kinv * res
+    else:
+        spsol = Kinv.solve(res.FV().NumPy()[fes.FreeDofs()])
+        sol.vec.data.FV().NumPy()[fes.FreeDofs()] = spsol
     
     t_solve = time() - tic
 
@@ -459,6 +471,7 @@ def solve_magnetoharmonic(
                 "e": {}}
     results = {
         "solution": solution,
+        "trial": {"a": a, "e": e},
         "test": {"a": a_, "e": e_},
         "bundles": bundles,
         "info": {
