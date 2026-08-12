@@ -304,6 +304,7 @@ def solve_magnetoharmonic(
         
     t0 = time()
     jw = 1j * 2 * ngs.pi * frequency
+    K = None
     txtref = f"Matrix decomposition with {solver}... "
     
     if verbose >= 1:
@@ -442,7 +443,7 @@ def solve_magnetoharmonic(
         sol.vec.data -= Kinv * res
     else:
         spsol = Kinv.solve(res.FV().NumPy()[fes.FreeDofs()])
-        sol.vec.data.FV().NumPy()[fes.FreeDofs()] = spsol
+        sol.vec.data.FV().NumPy()[fes.FreeDofs()] = - spsol
     
     t_solve = time() - tic
 
