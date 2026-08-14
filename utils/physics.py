@@ -477,15 +477,23 @@ def solve_magnetoharmonic(
         "bundles": bundles,
         "info": {
             "fes": fes,
-            "reluctivity": reluctivity,
-            "magnetization": magnetization,
-            "frequency": frequency,
-            "supply": supply,
-            "conductivity": conductivity,
+            "reluctivity" : reluctivity,
+            "magnetization" : magnetization,
+            "frequency" : frequency,
+            "supply" : supply,
+            "conductivity" : conductivity,
             "Kinv": Kinv,
             "K" : K,
-            "F": -res,
+            "F" : -res,
             "solver": solver,
+            "bonus_intorder" : bonus_intorder,
+            "verbose" : verbose, 
+            "taskmanager" : taskmanager,
+            "robin_bnd" : robin_bnd, 
+            "robin_coeff" :robin_coeff, 
+            "a_dirichlet" : a_dirichlet,
+            "h_tangential" : h_tangential,
+            "fix1dof" : fix1dof,
             "walltime" : {"fes": t_fes, 
                           "assembly": t_assembly, 
                           "decomposition": t_decomposition, 
@@ -501,15 +509,101 @@ def solve_magnetoharmonic(
        
     return results
 
+def operator_magnetoquasistatic_time_domain(state : dict,
+                                            dt : float,
+                                            theta : float = 0.5,
+                                            bonus_intorder : int = 3,
+                                            # Slot model - mixed boundary conditions
+                                            # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                                            #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                                            robin_bnd   : str = None, # Boundary name where apply mixed condition
+                                            robin_coeff : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                                            )-> ngs.comp.SumOfIntegrals:
+    """ Operator of asymmetric magnetoquasistatic formulation """
+
+    conductivity = state["info"]["conductivity"]
+    reluctivity = state["info"]["reluctivity"]
+    supply = state["info"]["supply"]
+    bundles = supply.keys()
+    e_ = state["test"]["e"]
+    a_ = state["test"]["a"]
+    eNew = state["trial"]["e"]
+    aNew = state["trial"]["a"]
+
+    K = 0
+
+    # Magnetostatic part
+    if theta >0:
+        K = theta * reluctivity(ngs.Norm(Curl(aNew))) * Curl(aNew) * Curl(a_) * ngs.dx(bonus_intorder = bonus_intorder)
+
+    # Eddy-current + constraint coupling in each bundle
+    for bundle in bundles:
+        K += conductivity * ( aNew/dt  + theta * eNew[bundle]) * (a_ + e_[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+
+        #Optional Robin term
+    if robin_bnd is not None:
+        K += a_ * robin_coeff / (1-robin_coeff) * aNew * ngs.ds(robin_bnd)
+
+    return K.Compile()
+
+
+def rhs_magnetoquasistatic_time_domain(state : dict,
+                                       t : float,
+                                       dt : float,
+                                       theta : float = 0.5,
+                                       bonus_intorder : int = 3,
+                                       # Slot model - mixed boundary conditions
+                                       # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                                       #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                                       robin_bnd   : str = None, # Boundary name where apply mixed condition
+                                       robin_coeff : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                                       a_dirichlet : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # non-zero Dirichlet, in fes
+                                       h_tangential   : ngs.GridFunction | ngs.CoefficientFunction | float = 0,  # Neumann trace
+                                       )-> ngs.comp.SumOfIntegrals:
+
+    """ Right-hand side of asymmetric magnetoquasistatic formulation """
+
+    mesh = state["info"]["fes"].mesh
+    
+    conductivity = state["info"]["conductivity"]
+    reluctivity = state["info"]["reluctivity"]
+    magnetization = state["info"]["magnetization"]
+    supply = state["info"]["supply"]
+    bundles = supply.keys()
+
+    J = {bundle: lambda t: supply[bundle](t) / ngs.Integrate(1, mesh.Materials(bundle))
+        for bundle in bundles}
+    e_ = state["test"]["e"]
+    a_ = state["test"]["a"]
+    eOld = state["solution"]["e"]
+    aOld = state["solution"]["a"]
+
+    F = (theta * magnetization(t+dt) + (1-theta) * magnetization(t)) * Curl(a_) * ngs.dx(bonus_intorder = bonus_intorder)
+    F += - reluctivity(ngs.Norm(Curl(aOld))) * Curl(aOld)            * Curl(a_) * ngs.dx(bonus_intorder = bonus_intorder)
+
+    # Eddy-current + constraint coupling in each bundle
+    for bundle in bundles:
+        F += conductivity * ( aOld/dt  - (1-theta) * eOld[bundle]) * (a_ + e_[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+        F += - (theta*J[bundle](t+dt) + (1-theta)*J[bundle](t)) * e_[bundle] * ngs.dx(bundle)
+
+    # Optional Robin term
+    if robin_bnd is not None:
+        lf += robin_coeff / (1-robin_coeff) * a_dirichlet * a_ * ngs.ds(robin_bnd)
+        lf += h_tangential * a_ * ngs.ds(robin_bnd)
+
+    return F.Compile()
+
+
+
+
 #%% Post-processing
 
 
-def dual_trace(
-    fes: ngs.FESpace,  # finite element space; should have dirichlet = bnd
-    bnd: str,          # boundary name where to compute the dual trace
-    nu: ngs.GridFunction | ngs.CoefficientFunction, # reluctivity
-    a_ref: ngs.GridFunction | ngs.CoefficientFunction # reference magnetic vector potential
-    ) -> ngs.GridFunction:
+def dual_trace(fes: ngs.FESpace,  # finite element space; should have dirichlet = bnd
+               bnd: str,          # boundary name where to compute the dual trace
+               nu: ngs.GridFunction | ngs.CoefficientFunction, # reluctivity
+               a_ref: ngs.GridFunction | ngs.CoefficientFunction # reference magnetic vector potential
+               ) -> ngs.GridFunction:
     """
     Compute the tangential magnetic field on a boundary by dual projection.
 
