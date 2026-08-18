@@ -3,10 +3,13 @@
 Provide utilities related to the physical formulation and associated solvers.
 
 Functions defined here:
+- state2gfu                 (helper)
+- gfu2state                 (helper)
 - Curl                      (helper)
 - average_property          (helper)
 - magnetization_halbach     (helper)
-- solve_magnetoharmonic     (main physical solver)
+- solve_magnetoharmonic     (main physical solvers)
+- newton                    (main physical solvers)
 - dual_trace                (post-processing)
 - electric_field            (post-processing)
 - current_density           (post-processing)
@@ -42,6 +45,120 @@ import scipy.sparse as sp
 
 
 #%% Helpers
+
+
+def state2gfu(state : dict) -> ngs.GridFunction:
+    """
+    Extract the solution state from a simulation result dictionary and return
+    it as an NGSolve GridFunction.
+
+    The function reconstructs a GridFunction associated with the finite element
+    space stored in ``state["info"]["fes"]`` and copies the magnetic vector
+    potential and, when present, the electric potentials of the conducting
+    bundles from the solution dictionary.
+
+    Parameters
+    ----------
+    state : dict
+        Simulation state dictionary, typically returned by a magneto-harmonic
+        solver. It is expected to contain:
+
+        ``state["info"]["fes"]``
+            The NGSolve finite element space associated with the solution.
+
+        ``state["solution"]["a"]``
+            The magnetic vector potential GridFunction.
+
+        ``state["solution"]["e"]``
+            A dictionary mapping conducting bundle names to their corresponding
+            electric potential GridFunctions.
+
+        ``state["bundles"]``
+            Iterable containing the names of the conducting bundles. The
+            corresponding electric potentials are stored in the components
+            following the magnetic vector potential.
+
+    Returns
+    -------
+    ngs.GridFunction
+        A GridFunction defined on ``state["info"]["fes"]`` containing the
+        complete solution state. The first component contains the magnetic
+        vector potential, while subsequent components contain the electric
+        potentials associated with the conducting bundles.
+
+        If no bundle electric potentials are present, the magnetic vector
+        potential is copied directly into the returned GridFunction.
+
+    Notes
+    -----
+    The function supports both compound finite element spaces, where the
+    solution consists of multiple components, and single-component spaces
+    containing only the magnetic vector potential.
+    """
+
+    fes = state["info"]["fes"]
+    sol = ngs.GridFunction(fes)
+    try:
+        sol.components[0].vec.data = state["solution"]["a"].vec
+        for i, bundle in enumerate(state["bundles"]):
+                    sol.components[i + 1].vec.data = state["solution"]["e"][bundle].vec
+    except:
+        sol.vec.data = state["solution"]["a"].vec
+    return sol
+
+
+def gfu2state(gfu : ngs.GridFunction,
+              state : dict) -> ngs.GridFunction:
+    """
+    Update a simulation state dictionary from an NGSolve GridFunction.
+
+    The function creates a shallow copy of the provided state dictionary and
+    replaces the solution fields with the components of ``gfu``. For a
+    compound finite element space, the first component is interpreted as the
+    magnetic vector potential and the subsequent components as the electric
+    potentials associated with the conducting bundles. For a single-component
+    space, ``gfu`` is interpreted directly as the magnetic vector potential.
+
+    Parameters
+    ----------
+    gfu : ngs.GridFunction
+        NGSolve GridFunction containing the solution state. For a compound
+        finite element space, its components are expected to be ordered as:
+
+        - component 0: magnetic vector potential ``a``.
+        - components 1..N: electric potentials ``e`` for the conducting bundles.
+
+    state : dict
+        Existing simulation state dictionary. It is expected to contain:
+
+        ``state["solution"]``
+            Dictionary containing the magnetic vector potential ``"a"`` and,
+            when applicable, the bundle electric potentials ``"e"``.
+
+        ``state["bundles"]``
+            Iterable containing the names of the conducting bundles, in the
+            same order as the corresponding components of ``gfu``.
+
+    Returns
+    -------
+    dict
+        A shallow copy of ``state`` with its solution fields updated from
+        ``gfu``. The original top-level state dictionary is not modified.
+
+    Notes
+    -----
+    If the GridFunction is not a compound space, the entire ``gfu`` is stored
+    as the magnetic vector potential under ``state_copy["solution"]["a"]``.
+    """
+    state_copy = state.copy()
+    try:
+        state_copy["solution"]["a"] = gfu.components[0]
+        for i, bundle in enumerate(state["bundles"]):
+            state_copy["solution"]["e"][bundle] = gfu.components[i + 1]
+    except:
+        state_copy["solution"]["a"] = gfu
+    return state_copy
+
 
 def Curl(u: ngs.GridFunction | ngs.CoefficientFunction
          ) -> ngs.CoefficientFunction:
@@ -501,6 +618,332 @@ def solve_magnetoharmonic(
        
     return results
 
+
+def newton(residual : ngs.BilinearForm,                   # residual (written using a bilinearform, actually not bilinear)
+           initial_state :  dict,                         # initial guess (state structure)
+           # Inspection parameters
+           verbose : int = 1,                             # verbosity level (0 - silent to 3 - detailed)
+           # Newton parameters
+           maxit_newton : int = 50,              # maximum number of Newton outer iterations
+           atol_decrement : float = 1e-10,        # (absolute) tolerance on Newton decrement : sqrt( < residual(uOld), du > )
+           atol_residual : float = 1e-10,         # (absolute) tolerance on residual 
+           rtol_residual : float = 1e-10,        # relative tolerance on the residual between 2 iterations (to save 1 useless iteration in case of linear problem)
+           # Line search parameters
+           linesearch : bool = True,             # flag to enable line search (recommended)
+           maxit_linesearch : int = 33,          # maximum iteration number within the line search
+           minstep_linesearch : float = 1e-10,   # minimum step size allowed in the line search 
+           armijo_factor_linesearch : float = 0.1,      # Armijo coefficient in [0, 1) such that |residual(u-step*du)|² < residual²(u) - armijo_linesearch*step*(|residual(u)|²)'(du)
+           step_factor_linesearch : float = 0.5, # step size reduction factor in (0, 1) to reduce the step if too big
+           taskmanager : bool = False,          # flag to enable parallelization with TaskManager during assembly
+           solver : str = "pardiso"              # method to solve the linear systems
+           ) -> dict:
+    """
+    Solve a nonlinear finite element problem using Newton's method with optional
+    backtracking line search.
+
+    Parameters
+    ----------
+    residual : ngs.BilinearForm
+        NGSolve bilinear form representing the nonlinear residual operator. Although
+        implemented using a ``BilinearForm``, the operator may be nonlinear in the
+        solution. Its linearization is assembled through
+        ``residual.AssembleLinearization(...)`` and is used to compute the Newton
+        correction.
+
+    initial_state : dict
+        Initial simulation state containing the initial guess and associated
+        metadata. The state must be compatible with :func:`state2gfu` and
+        :func:`gfu2state`.
+
+    verbose : int, optional
+        Verbosity level controlling diagnostic output:
+
+        - ``0``: silent.
+        - ``1``: print failure messages.
+        - ``2``: print Newton iteration and convergence information.
+        - ``3``: additionally print detailed timing information.
+
+        Default is ``1``.
+
+    maxit_newton : int, optional
+        Maximum number of Newton iterations. Default is ``50``.
+
+    atol_decrement : float, optional
+        Absolute tolerance on the Newton decrement. The iteration is stopped when
+            ``sqrt(abs(<residual, descent>)) < tol_decrement``.
+        Default is ``1e-10``.
+
+    atol_residual : float, optional
+        Absolute tolerance on the norm of the residual. The iteration is stopped
+        when the residual norm falls below this value. 
+        Default is ``1e-10``.
+
+    rtol_residual : float, optional
+        Relative residual tolerance. It is used both to detect an effectively
+        linear problem from the ratio of two successive residuals and as a stopping
+        criterion based on the residual relative to the initial residual.
+        Default is ``1e-10``.
+
+    linesearch : bool, optional
+        If True, perform a backtracking line search on each Newton update.
+        Disabling line search is not recommended but can sometimes save time.
+        Default is ``True``.
+
+    maxit_linesearch : int, optional
+        Maximum number of backtracking iterations allowed during the line search.
+        Default is ``33``.
+
+    minstep_linesearch : float, optional
+        Minimum allowed line-search step size. The line search fails if the step
+        becomes smaller than this value. 
+        Default is ``1e-10``.
+
+    armijo_factor_linesearch : float, optional
+        Armijo parameter controlling the sufficient decrease condition. It should
+        satisfy ``0 <= armijo_factor_linesearch < 1``. 
+        Default is ``0.1``.
+
+    step_factor_linesearch : float, optional
+        Factor by which the line-search step is reduced when the Armijo condition
+        is not satisfied. It should satisfy ``0 < step_factor_linesearch < 1``.
+        Default is ``0.5``.
+
+    taskmanager : bool, optional
+        If True, use NGSolve's ``TaskManager`` during residual evaluation and
+        linearization to enable parallel assembly. 
+        Default is ``False``.
+
+    solver : str, optional
+        Linear solver used to compute the Newton correction. The default,
+        ``"pardiso"``, uses NGSolve's direct solver interface. ``"superlu"`` uses
+        SciPy's sparse LU factorization instead. 
+        Default is ``"pardiso"``.
+
+    Returns
+    -------
+    dict
+        Updated simulation state containing the converged or final solution and
+        Newton solver information. In addition to the fields already present in
+        ``initial_state``, the result contains:
+
+        ``"residual"``
+            List of residual norms recorded during the Newton iterations.
+
+        ``"decrement"``
+            List of Newton decrement values for each iteration.
+
+        ``"info"]["status"]``
+            Solver status code:
+
+            - ``0``: successful convergence.
+            - ``1``: maximum number of Newton iterations reached.
+            - ``2``: minimum line-search step reached.
+            - ``3``: maximum number of line-search iterations reached.
+            - ``4``: NaN detected in the residual.
+
+        ``"info"]["linear_detected"]``
+            Indicates whether the problem was detected as effectively linear from
+            the relative change in the residual.
+
+        ``"info"]["iteration"]``
+            Number of the last Newton iteration performed.
+
+        ``"info"]["Kinv"]``
+            Factorization or inverse of the final linearized system matrix.
+
+        ``"info"]["K"]``
+            Final assembled linearized system matrix.
+
+        ``"info"]["wall_time"]``
+            Dictionary containing timing information for the solver. Individual
+            assembly and solve timings are currently not populated, while
+            ``"total"`` contains the total wall-clock time.
+
+    Notes
+    -----
+    At each Newton iteration, the nonlinear residual is evaluated and its
+    linearization is assembled. The resulting linear system is solved for the
+    Newton descent direction. If line search is enabled, the update is reduced
+    until a sufficient decrease of the squared residual norm satisfies the
+    Armijo condition.
+
+    The returned state is reconstructed using :func:`gfu2state`, preserving the
+    state structure used by the surrounding finite element formulation.
+    """
+
+    # 1) Initialization
+    tStart = time()
+    if verbose >= 2 : print(f"******************** START NEWTON ********************")
+    if verbose >= 2 : print(f"Solver: {solver.lower()} | Multithreaded Assembly: {taskmanager}")
+    if verbose >= 3 : print(f"Initializing  ..... ", end = "")
+    state = state2gfu(initial_state)
+    fes = state.space
+    res = state.vec.CreateVector()
+    res_linesearch = state.vec.CreateVector()
+    state_linesearch = state.vec.CreateVector()
+    descent = state.vec.CreateVector()
+    fes = state.space
+    status = 0
+    res2 = lambda res : np.dot(res.FV().NumPy()[fes.FreeDofs()],res.FV().NumPy()[fes.FreeDofs()])
+
+    decrement_list = []
+    residual_list = []
+    if verbose >= 3 : print(f"done ({(time()-tStart) * 1000 :.2f} ms).")
+    if verbose >= 3 : print(f"     ---------------- Start loop  ----------------")
+
+    if taskmanager:
+        with ngs.TaskManager(): residual.Apply(state.vec, res)
+    else: residual.Apply(state.vec, res)
+    residual_list.append(np.sqrt(res2(res)))
+
+    # 2) Newton loop
+    for counter_newton in range(1,maxit_newton+1):
+        if verbose >= 2 : print(f" It {counter_newton} -------------------------------------------------")
+
+        # a) NaN check
+        if np.isnan(residual_list[-1]):
+            status = 4
+            if verbose >= 1 : 
+                print(f"❌ FAILURE: NaN detected !!")
+            break
+        # b) Compute residual and linearization
+        tStartAssembly = time()
+        if verbose >= 3 : print(f" - Assembly ....... ", end = "")
+        if taskmanager:
+            with ngs.TaskManager():
+                residual.Apply(state.vec, res)
+                residual.AssembleLinearization(state.vec)
+        else:
+            residual.Apply(state.vec, res)
+            residual.AssembleLinearization(state.vec)
+        if verbose >= 3 : print(f"done ({(time()-tStartAssembly) * 1000 :.2f} ms).")
+
+        # c) Solve
+        tStartSolve = time()
+        if verbose >= 3 : print(f" - Solve .......... ", end = "")
+        if solver.lower() != "superlu":
+            Kinv  = residual.mat.Inverse(freedofs=fes.FreeDofs(), inverse = solver)  
+            descent.data = Kinv * res
+        else:
+            rows,cols,vals = residual.mat.COO()
+            Ksp =  sp.csc_matrix((vals,(rows,cols)))
+            Ksp = Ksp[fes.FreeDofs(),:][:,fes.FreeDofs()]
+            Kinv = sp.linalg.splu(Ksp)
+            spsol = Kinv.solve(res.FV().NumPy()[fes.FreeDofs()])
+            descent.data.FV().NumPy()[fes.FreeDofs()] = spsol
+        if verbose >= 3 : print(f"done ({(time()-tStartSolve) * 1000 :.2f} ms).")
+
+
+        # d) Calculation of Newton's decrement
+        decrement = np.sqrt(abs(ngs.InnerProduct(res, descent)))
+        decrement_list.append(decrement)
+
+        if verbose >= 2 : print(f" - Conv : ||residual|| = {residual_list[-1]:.4e} | decr = {decrement_list[-1] :.4e}")
+
+        # e) Line search
+        if linesearch:
+            tStartLineSearch = time()
+            if verbose >= 2 : print(f" - Line search .... ")
+            step_linesearch = 1.0
+            counter_linesearch = 0
+            state_linesearch.data = state.vec - step_linesearch * descent
+            if taskmanager:
+                with ngs.TaskManager():
+                    residual.Apply(state_linesearch, res_linesearch)
+            else:
+                residual.Apply(state_linesearch, res_linesearch)
+            res2_state = res2(res)
+            res2_linesearch = res2(res_linesearch)
+            if verbose >= 2 : print(f"   it {counter_linesearch} : ||residual|| = {np.sqrt(res2_linesearch) :.4e} | step = {step_linesearch :.2e}")
+
+            while not (res2_linesearch < (1 - 2 * armijo_factor_linesearch * step_linesearch) * res2_state):
+                counter_linesearch += 1
+                step_linesearch *= step_factor_linesearch
+                state_linesearch.data = state.vec - step_linesearch * descent
+                if taskmanager:
+                    with ngs.TaskManager():
+                        residual.Apply(state_linesearch, res_linesearch)
+                else:
+                    residual.Apply(state_linesearch, res_linesearch)
+                res2_linesearch = res2(res_linesearch)
+                if verbose >= 2 : print(f"   it {counter_linesearch} : ||residual|| = {np.sqrt(res2_linesearch) :.4e} | step = {step_linesearch :.2e}")
+
+                if counter_linesearch >= maxit_linesearch:
+                    if verbose >= 1 : print(f"❌ FAILURE: maximal number of line search iterations reached !!")
+                    status = 3
+                    break
+
+                if step_linesearch < minstep_linesearch:
+                    if verbose >= 1 : print(f"❌ FAILURE: minimal line search step reached !!")
+                    status = 2
+                    break
+            
+            if verbose >= 3 : print(f" - Line search done ({(time()-tStartLineSearch) * 1000 :.2f} ms).")
+        
+        if verbose >= 3 : print(f"     ---------------- End loop ----------------")
+        # f) Update and residual computation
+        if not status: 
+            state.vec.data = state_linesearch
+            res.data = res_linesearch
+            residual_list.append(np.sqrt(res2(res)))
+        else:
+            state.vec.data = state.vec - step_linesearch * descent
+            if taskmanager:
+                with ngs.TaskManager(): residual.Apply(state.vec, res)
+            else: residual.Apply(state.vec, res)
+            residual_list.append(np.sqrt(res2(res)))
+
+        # g) Stopping criteria
+        if residual_list[-1] / residual_list[-2] < rtol_residual:
+            if verbose >= 2 : print(f"Stop because linear problem detected.")
+            linear = True
+            break
+        
+        if decrement_list[-1] < atol_decrement : 
+            if verbose >= 2 : print(f"Stop because decrement is lower than tol_decrement.")
+            break
+
+        if residual_list[-1] < atol_residual : 
+            if verbose >= 2 : print(f"Stop because residual is lower than tol_residual.")
+            break
+
+        if residual_list[-1] / residual_list[0] < rtol_residual:
+            if verbose >= 2 : print(f"Stop because relative residual is lower than rtol_residual.")
+            break
+
+        if counter_newton >= maxit_newton: 
+            if verbose >= 1 : print(f"❌ FAILURE: maximum number of Newton iterations reached !!")
+            status = 1
+            break
+
+    # 3) Export results
+    if verbose >=2 and not status : 
+        print(f"-------------------------------------------------------")  
+        print(f" ✅ SUCCESS: Newton has converged in {counter_newton} iteration", end = "")
+        if  counter_newton > 1 : print("s.")
+        else : print(".") 
+    if verbose >=2 :  print(f" Total wall time: {(time() - tStart) :.2f} s.")
+
+    result = initial_state.copy()
+    result["info"]["status"] = status
+    result["info"]["linear_detected"] = linear
+    result["info"]["iteration"] = counter_newton
+    result["info"]["Kinv"] = Kinv
+    result["info"]["K"] = residual.mat
+    result["info"]["status"] = status
+    result["linear_detected"] = linear
+    result["iteration"] = counter_newton
+    result["residual"] = residual_list
+    result["decrement"] = decrement_list
+    result["info"]["wall_time"] = { "fes": None, 
+                                    "assembly": None, 
+                                    "decomposition": None, 
+                                    "rhs": None, 
+                                    "solve": None,
+                                    "total":time() - tStart}
+
+    if verbose >=2 : print(f" ********************* END NEWTON ********************* ")  
+    return gfu2state(state, result)
 
 #%% Post-processing
 
