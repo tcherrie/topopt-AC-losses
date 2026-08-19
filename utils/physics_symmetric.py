@@ -1873,54 +1873,26 @@ def joule_losses2(results : dict,
 
     Notes
     -----
-    - The Joule losses are computed as:
+    - More efficient alternative implementation than
         P = 1/2 ∫_Ω (|J|² / σ) dx
-      where J is the complex current density.
-    - The factor 1/2 accounts for time-averaging in harmonic regime; 
-    we assume phasors modules are amplitude and not RMS values.
-    - A small regularization term is added to σ to avoid division by zero.
+      We integrate on each bundle separating DC and AC losses.
     """
-
-    # Current density from post-processing
-    #j = current_density2(results)
 
     # Conductivity with numerical safety offset
     sigma = results["info"]["conductivity"] + 1e-300
-
     mesh = results["info"]["fes"].mesh
 
-    # Quadrature order adapted to solution polynomial order
-    order = 2 * results["solution"]["a"].space.globalorder + 1
-
-    """
-    expr = ngs.InnerProduct(j, j).real / sigma
-    expr.Compile()
-
-    # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
-    P = ngs.Integrate(
-        expr,
-        mesh.Materials(zone),
-        order=order) / 2
-    """
-
-    # More efficient alternative
-
     E =  electric_field_eddy_current(results = results)
+    E.Compile()
 
-    Pac = ngs.Integrate(
-            ngs.InnerProduct(E,E).real * sigma,
-            mesh.Materials(zone),
-            order=order) / 2
-
-    Pdc =0
+    Pdc = 0
+    Pac = 0
     I = results["info"]["supply"]
     for bundle in results["bundles"]:
         if match(zone, bundle):
-            #print(bundle)
-            edc_loc = I[bundle] / ngs.Integrate(sigma, mesh.Materials(bundle))
-            Pdc +=  ngs.Integrate((edc_loc*edc_loc.conjugate()).real * sigma, mesh.Materials(bundle), order = mesh.GetCurveOrder()) / 2
-
-    # Imaginary part is zero in theory; only real part is used explicitly
+            intSigma = integrate(sigma, results, bundle)
+            Pac += integrate(ngs.InnerProduct(E,E).real * sigma, results, bundle) / 2
+            Pdc += abs(I[bundle])**2 / intSigma / 2
 
     return Pac + Pdc
 

@@ -730,10 +730,8 @@ def partiald_joule_losses2(results :     dict,
         # Electric field from primal solution
         E_eddy = electric_field_eddy_current(results)
         E_total = electric_field2(results, E_eddy=E_eddy)
-        #JsOverSigma = E_total - E_eddy
         I = results["info"]["supply"]
         sigma = results["info"]["conductivity"]
-        #mesh = results["info"]["fes"].mesh
 
         # Adjoint component from magnetic vector potential
         pa = adjoint["solution"]["a"]
@@ -741,23 +739,26 @@ def partiald_joule_losses2(results :     dict,
         for bundle in adjoint["bundles"]:
             # DC contribution to account for the dependance of Jdc = I*sigma / int(sigma) with sigma
             intSigma = integrate(sigma, results, bundle)
-            df += ngs.InnerProduct(pa, I[bundle] ).real / intSigma * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
-            df += - integrate(ngs.InnerProduct(pa, I[bundle] * sigma).real, results, bundle) / intSigma ** 2 * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            df += - ngs.InnerProduct(pa, I[bundle] / intSigma).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            intPaISigma = integrate(ngs.InnerProduct(pa, I[bundle] / intSigma ** 2 * sigma), results, bundle)
+            df += intPaISigma.real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
             # AC contribution from Lagrangian
             df += ngs.InnerProduct(pa + adjoint["solution"]["E"][bundle], -E_eddy).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
             
             # contribution from objective function
-            # p = sigma * E²/2 =sigma * (Edc + Eac)² /2 = sigma * (Edc²/2 + Edc Eac + Eac²/2)
+            # p = sigma * E²/2 =sigma * (Edc + Eac)² /2 = sigma * (Edc²/2 + Edc Eac/2 +  Eac Edc/2 + Eac²/2)
             # Eac = jw (a + e) independant of sigma
             # p'(sigma') = [AC]  E²/2 * sigma' +  [DC] sigma * (Edc²/2 + Edc Eac)'
             # AC term (easy one)
             df += (ngs.InnerProduct(E_total, E_total)).real / 2 * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
             # DC term
             # Edc = I/int(sigma) depends on sigma
-            # (Edc²/2 + Edc Eac)' = <Edc, Edc'(sigma')> + <Edc'(sigma'), Eac> =  <(Edc + Eac), Edc'(sigma')> = <E, Edc'(sigma')>
-            # int(<Edc'(sigma'), E> sigma) = int( <- I/int(sigma)² int(sigma'), E> sigma) =  - I/int(sigma)² int(<sigma, E>) int(sigma') 
-            intESigma = integrate(ngs.InnerProduct(sigma, E_total), results, bundle)
-            df += - (I[bundle]/intSigma**2 * intESigma).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            # (Edc²/2 + Edc Eac/2 +  Eac Edc/2)' = <Edc, Edc'(sigma')> + 1/2<Eac, Edc'(sigma') > + 1/2<Edc'(sigma'), Eac > 
+            # =  <(Edc + Re(Eac) ), Edc'(sigma')> = <(Edc + Re(Eac), Edc'(sigma')>
+            # = <(Edc + Re(Eac) ), Edc'(sigma')> = <(Edc + Re(Eac), Edc'(sigma')>
+            # int(<Edc'(sigma'), Edc + Re(Eac)> sigma) = int( <- I/int(sigma)² int(sigma'), Edc + Re(Eac)> sigma) =  - I/int(sigma)² int(<sigma, Edc + Re(Eac)>) int(sigma') 
+            intEI = integrate(sigma * ngs.InnerProduct(E_total, I[bundle]/intSigma**2), results, bundle)
+            df += - intEI.real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
     # elif wrt.lower() == "resistivity":
     #     TODO
 
