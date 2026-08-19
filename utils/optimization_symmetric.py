@@ -43,6 +43,7 @@ import ngsolve as ngs
 from ngsolve.webgui import Draw
 from copy import copy
 from utils.physics_symmetric import current_density, electric_field
+from utils.physics_symmetric import current_density2, electric_field2, electric_field_eddy_current
 from utils.geometry import mask
 
 #%% Projected gradient descent
@@ -254,8 +255,10 @@ def gradient_descent(state :        callable,           # takes x0 ngs.GridFunct
 def taylor_test(F:      callable, 
                dF:      callable, 
                x0:      ngs.GridFunction, 
+               seed:    int                 = 0,
                pert:    ngs.GridFunction    = None, 
-               H:       list|np.ndarray   = np.logspace(-9,1,20)
+               H:       list|np.ndarray     = np.logspace(-9,1,20),
+               verbose: int                 = 1
                ) -> tuple:
     """
     Perform a Taylor test to verify correctness of a functional gradient.
@@ -302,29 +305,44 @@ def taylor_test(F:      callable,
     """
 
     # Evaluate baseline functional value
+    t0 = time()
+    if verbose >=1 : print("Compute reference F ... ", end = "")
     F0 = F(x0)
+    if verbose >=1 : print(f" done ({(time()-t0) * 1000 :.0f} ms) ")
 
     # Generate random perturbation if none is provided
+    t0 = time()
+    if verbose >=1 : print("Generate perturbation ... ", end = "")
     if pert is None:
         pert = ngs.GridFunction(x0.space)
-        pert.vec.data = np.random.rand(len(pert.vec)) * x0.vec
+        np.random.seed(seed)
+        pert.vec.data = np.random.rand(len(pert.vec), ) * x0.vec
+    if verbose >=1 : print(f" done ({(time()-t0) * 1000 :.0f} ms) ")
 
     # Directional derivative using provided gradient
+    t0 = time()
+    if verbose >=1 : print("Compute directional derivative ... ", end = "")
     dF0 = ngs.InnerProduct(dF(x0).vec, pert.vec)
+    if verbose >=1 : print(f" done ({(time()-t0) * 1000 :.0f} ms) ")
 
     taylor_remainder = []
     dF_estimated = []
 
     # Loop over step sizes
-    for h in H:
+    for i, h in enumerate(H):
+        t0 = time()
+        if verbose>=1 : print(f"it {i} / {len(H)} ({h = : .2e}) : ... ", end = "")
         # Perturbed state
         x1 = x0 + h * pert
 
         # Finite difference derivative approximation
-        dF_estimated.append((F(x1) - F0) / h)
+        
+        Fx1 = F(x1)
+        dF_estimated.append((Fx1 - F0) / h)
 
         # Taylor remainder (should scale ~ h^2 if correct)
-        taylor_remainder.append(abs(F(x1) - F0 - dF0 * h))
+        taylor_remainder.append(abs(Fx1 - F0 - dF0 * h))
+        if verbose >=2 : print(f" done ({(time()-t0) * 1000 :.0f} ms)")
 
     return H, taylor_remainder, dF0, dF_estimated
 
@@ -484,7 +502,7 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
 def dd_joule_losses(results : dict,          
                     slot    : str   = "slot.*",
                     bonus_intorder : int = 3
-                    ) -> ngs.SymbolicBFI :
+                    ) -> ngs.comp.SumOfIntegrals :
     """
     Compute the directional derivative of Joule losses.
 
@@ -530,6 +548,55 @@ def dd_joule_losses(results : dict,
     # Returns the directional derivative of losses w.r.t the state
     return ngs.InnerProduct(j, j_) / sigma * ngs.dx(slot, bonus_intorder = bonus_intorder)
 
+
+def dd_joule_losses2(results : dict,          
+                    slot    : str   = "slot.*",
+                    bonus_intorder : int = 3
+                    ) -> ngs.comp.SumOfIntegrals :
+    """
+    Compute the directional derivative of Joule losses.
+
+    This function evaluates the contribution of the current density to the
+    Joule loss functional and computes its directional derivative with
+    respect to a test perturbation.
+
+    Parameters
+    ----------
+    results : dict
+        Dictionary containing simulation results, including fields required
+        to compute current densities and material properties.
+
+    slot : str, optional
+        Subdomain selection pattern defining where the Joule losses are
+        evaluated (typically stator slot regions).
+        
+    bonus_intorder : int, optional
+        Bonus integration order.
+
+    Returns
+    -------
+    form
+        Weak form representing the directional derivative of Joule losses
+        integrated over the specified slot region.
+
+    Notes
+    -----
+    - The conductivity is regularized with a small offset (1e-300) to avoid
+      division by zero.
+    - The result is expressed as a finite-element integral form.
+    """
+
+    # Current density for primal (solution) state
+    j = current_density2(results, type="solution")
+
+    # Current density for perturbation (test) state
+    j_ = current_density2(results, type="test")
+
+    # Electrical conductivity (regularized to avoid division by zero)
+    sigma = results["info"]["conductivity"] + 1e-300
+
+    # Returns the directional derivative of losses w.r.t the state
+    return ngs.InnerProduct(j, j_) / sigma * ngs.dx(slot, bonus_intorder = bonus_intorder)
 
 def partiald_joule_losses(results :     dict, 
                           adjoint :     dict, 
@@ -586,7 +653,7 @@ def partiald_joule_losses(results :     dict,
         # Electric field from primal solution
         E = -electric_field(results)
 
-        # Air-domain adjoint component
+        # Adjoint component from magnetic vector potential
         pa = adjoint["solution"]["a"]
 
         # Contribution from conductor bundles
@@ -604,6 +671,85 @@ def partiald_joule_losses(results :     dict,
 
     return df.Assemble()
 
+def partiald_joule_losses2(results :     dict, 
+                          adjoint :     dict, 
+                          test , # symbolic test function, representing the pertubation direction
+                          wrt     :     str ="conductivity", 
+                          slot    :     str = "slot.*",
+                          bonus_intorder : int = 3,
+                          ) -> ngs.LinearForm:
+    """
+    Compute the partial Fréchet derivative of Joule losses.
+
+    This function evaluates the sensitivity of Joule losses with respect to a
+    chosen material parameter (typically conductivity). It assembles a
+    finite-element linear form using the primal and adjoint fields.
+
+    Parameters
+    ----------
+    results : dict
+        Primal simulation results, including finite-element spaces and fields.
+
+    adjoint : dict
+        Adjoint solution containing field decompositions over domains.
+
+    test : ngs.GridFunction or ngs.LinearForm
+        Test function used to build the weak form.
+
+    wrt : str, optional
+        Parameter with respect to which the derivative is computed.
+        Currently supports:
+        - "conductivity" (default)
+
+    slot : str, optional
+        Subdomain pattern where the derivative is evaluated.
+        
+    bonus_intorder : int, optional
+        Bonus integration order for conductivity terms.
+
+    Returns
+    -------
+    ngs.LinearForm
+        Assembled finite-element linear form representing the sensitivity.
+
+    Notes
+    -----
+    - Only conductivity derivatives are implemented.
+    - High-order quadrature is used for improved accuracy.
+    """
+
+    # Initialize weak form
+    df = ngs.LinearForm(test.space)
+
+    #mesh = results["info"]["fes"].mesh
+    #supply = results["info"]["supply"]
+    #sigma = results["info"]["conductivity"]
+
+    if wrt.lower() == "conductivity":
+
+        # Electric field from primal solution
+        E_eddy = electric_field_eddy_current(results)
+        E_total = electric_field2(results, E_eddy=E_eddy)
+        JsOverSigma = E_total - E_eddy
+
+        # Adjoint component from magnetic vector potential
+        pa = adjoint["solution"]["a"]
+
+        
+        for bundle in adjoint["bundles"]:
+            # Contribution from Lagrangian
+            df += ngs.InnerProduct(pa + adjoint["solution"]["E"][bundle], -E_eddy).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            # Contribution from objective function
+            #JsOverSigma = supply[bundle] / ngs.Integrate(1, mesh.Materials(bundle)) / sigma
+            df += -ngs.InnerProduct(JsOverSigma, JsOverSigma).real / 2 * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+
+        # Contribution from objective function
+        df += (ngs.InnerProduct(E_eddy, E_eddy)).real / 2 * test * ngs.dx(slot, bonus_intorder = bonus_intorder)
+
+    # elif wrt.lower() == "resistivity":
+    #     TODO
+
+    return df.Assemble()
 
 def d_joule_losses(results  : dict, 
                    val      : ngs.GridFunction, 
@@ -665,6 +811,78 @@ def d_joule_losses(results  : dict,
 
         # Assemble partial derivative contribution
         df = partiald_joule_losses(results=results,
+                                   adjoint=adjoint,
+                                   test=test,
+                                   wrt="conductivity",
+                                   slot=slot,
+                                   bonus_intorder = bonus_intorder)
+
+    # elif wrt.lower() == "resistivity":
+    #     TODO
+
+    return df
+
+
+def d_joule_losses2(results  : dict, 
+                   val      : ngs.GridFunction, 
+                   adjoint  : dict = None, 
+                   wrt      : str  ="conductivity",
+                   slot    : str = "slot.*",
+                   bonus_intorder : int = 3
+                   ) -> ngs.LinearForm:
+    """
+    Compute the total Fréchet derivative of Joule losses.
+
+    This function assembles the full sensitivity of the Joule loss functional
+    with respect to a given material parameter (typically conductivity). It
+    combines the adjoint contribution and the explicit partial derivative
+    into a single finite-element linear form.
+
+    Parameters
+    ----------
+    results : dict
+        Primal simulation results required to evaluate the state and fields.
+
+    val : ngs.GridFunction
+        Design variable (used only to access the finite-element space and
+        create a test function).
+
+    adjoint : dict, optional
+        Precomputed adjoint solution. If None, it is automatically computed.
+
+    wrt : str, optional
+        Parameter with respect to which the derivative is computed.
+        Currently supports:
+        - "conductivity" (default)
+        
+    bonus_intorder : int, optional
+        Bonus integration order for conductivity terms.
+
+    Returns
+    -------
+    ngs.LinearForm
+        Assembled Fréchet derivative of Joule losses.
+
+    Notes
+    -----
+    - If the adjoint is not provided, it is solved internally.
+    - Only conductivity derivatives are currently implemented.
+    """
+
+    # ------------------------------------------------------------
+    # Conductivity sensitivity (main implemented case)
+    # ------------------------------------------------------------
+    if wrt.lower() == "conductivity":
+
+        # Solve adjoint system if not provided
+        if adjoint is None:
+            adjoint = solve_adjoint(results, dd_joule_losses2)
+
+        # Test function in design space
+        test = val.space.TestFunction()
+
+        # Assemble partial derivative contribution
+        df = partiald_joule_losses2(results=results,
                                    adjoint=adjoint,
                                    test=test,
                                    wrt="conductivity",

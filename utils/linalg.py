@@ -3,6 +3,8 @@
 Provide utilities related to linear algebra
 
 Functions defined here:
+- L2norm
+- H1norm
 - sparse
 - vec
 - split_mat
@@ -30,9 +32,31 @@ __status__ = "Development"
 #%% Import
 
 from scipy.sparse import csc_matrix
+import ngsolve as ngs
 
 #%% Vector and matrices
 
+def L2norm(field,
+           mesh,
+           zone : str = None):
+    """ Compute L2 norm """
+    if zone is None:
+        return ngs.sqrt(ngs.Integrate(ngs.Norm(field)**2, mesh))
+    else:
+        return ngs.sqrt(ngs.Integrate(ngs.Norm(field)**2, mesh.Materials(zone)))
+
+
+def H1norm(field,
+           mesh,
+           gradfield : callable = None,
+           zone : str = None):
+    """ Compute H1 norm """
+    if gradfield is None:
+        expr = ngs.Norm(field)**2 + ngs.Norm(ngs.grad(field))**2
+    else:
+        expr = ngs.Norm(field)**2 + ngs.Norm(gradfield)**2
+    return ngs.sqrt(ngs.Integrate(expr, mesh))
+    
 def sparse(bf, freedofs_rows = None, freedofs_cols=None):
     """
     Convert a bilinear form into a sparse CSC matrix, optionally restricting

@@ -5,6 +5,7 @@ Provide utilities related to the physical formulation and associated solvers.
 Functions defined here:
 - state2gfu                 (helper)
 - gfu2state                 (helper)
+- surface                   (helper)
 - Curl                      (helper)
 - average_property          (helper)
 - magnetization_halbach     (helper)
@@ -190,10 +191,39 @@ def Curl(u: ngs.GridFunction | ngs.CoefficientFunction
     """
     return ngs.CF(((0, 1), (-1, 0)), dims=(2, 2)) * ngs.grad(u)
 
+def surface(zone: str,
+            mesh: ngs.comp.Mesh
+            ) -> float:
+    """
+    Compute the surface measure of a specified mesh region.
+
+    Parameters
+    ----------
+
+    zone : str
+        Name of the material region whose surface measure is to be computed.
+        The region is selected using ``mesh.Materials(zone)``.
+    
+    mesh : ngs.comp.Mesh
+            NGSolve computational mesh on which the surface is evaluated.
+
+    Returns
+    -------
+    float
+        Surface measure of the specified region, computed by integrating the
+        constant function ``1`` over the selected mesh region.
+
+    Notes
+    -----
+    The integration order is set to the curve order of the mesh using
+    ``mesh.GetCurveOrder()``.
+    """
+    return ngs.Integrate(1, mesh.Materials(zone), order = mesh.GetCurveOrder())
 
 def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
                      results: dict,
-                     zone: str = ".*"
+                     zone: str = ".*",
+                     order_min = 5,
                      ) -> float:
     """
     Compute the spatial average of a field over a given mesh region.
@@ -227,11 +257,11 @@ def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
 
     mesh = results["info"]["fes"].mesh
 
-    # Compute total area/volume of the selected region
-    surface_zone = ngs.Integrate(1, mesh.Materials(zone))
-
     # Compute integral of the field over the region and normalize
-    return ngs.Integrate(property, mesh.Materials(zone)) / surface_zone
+    try: order = max([mesh.GetCurveOrder(), results["info"]["fes"].components[0].globalorder + 1 , order_min])
+    except: order = max([mesh.GetCurveOrder(), results["info"]["fes"].globalorder + 1 , order_min])
+    
+    return ngs.Integrate(property, mesh.Materials(zone), order = order) / surface(zone, mesh)
 
 
 
@@ -440,7 +470,7 @@ def solve_magnetoharmonic(
         
     # Normalize supplied currents by bundle volume
     Jcplx = {
-        bundle: supply[bundle] / ngs.Integrate(1, mesh.Materials(bundle))
+        bundle: supply[bundle] / surface(bundle, mesh)
         for bundle in bundles
     }
 
@@ -1214,7 +1244,7 @@ def average_torque(results : dict,
     mesh = results["info"]["fes"].mesh
 
     # Airgap normalization area
-    S = ngs.Integrate(1, mesh.Materials(airgap))
+    S = surface(airgap, mesh)
 
     # Magnetic flux density
     b = Curl(results["solution"]["a"])

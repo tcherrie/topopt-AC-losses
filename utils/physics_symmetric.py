@@ -6,12 +6,15 @@ Functions defined here:
 - state2gfu                 (helper)
 - gfu2state                 (helper)
 - Curl                      (helper)
+- surface                   (helper)
 - average_property          (helper)
 - magnetization_halbach     (helper)
 - solve_magnetoharmonic     (main physical solvers)
+- solve_magnetoharmonic2     (main physical solvers), to check consistency of formulations
 - newton                    (main physical solvers)
 - dual_trace                (post-processing)
 - electric_field            (post-processing)
+- electric_field2           (post-processing), to check consistency of formulations
 - current_density           (post-processing)
 - joule_losses              (post-processing)
 - matrix_arkkio             (post-processing)
@@ -191,9 +194,39 @@ def Curl(u: ngs.GridFunction | ngs.CoefficientFunction
     return ngs.CF(((0, 1), (-1, 0)), dims=(2, 2)) * ngs.grad(u)
 
 
+def surface(zone: str,
+            mesh: ngs.comp.Mesh
+            ) -> float:
+    """
+    Compute the surface measure of a specified mesh region.
+
+    Parameters
+    ----------
+
+    zone : str
+        Name of the material region whose surface measure is to be computed.
+        The region is selected using ``mesh.Materials(zone)``.
+    
+    mesh : ngs.comp.Mesh
+            NGSolve computational mesh on which the surface is evaluated.
+
+    Returns
+    -------
+    float
+        Surface measure of the specified region, computed by integrating the
+        constant function ``1`` over the selected mesh region.
+
+    Notes
+    -----
+    The integration order is set to the curve order of the mesh using
+    ``mesh.GetCurveOrder()``.
+    """
+    return ngs.Integrate(1, mesh.Materials(zone), order = mesh.GetCurveOrder())
+
 def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
                      results: dict,
-                     zone: str = ".*"
+                     zone: str = ".*",
+                     order_min = 5,
                      ) -> float:
     """
     Compute the spatial average of a field over a given mesh region.
@@ -227,13 +260,11 @@ def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
 
     mesh = results["info"]["fes"].mesh
 
-    # Compute total area/volume of the selected region
-    surface_zone = ngs.Integrate(1, mesh.Materials(zone))
-
     # Compute integral of the field over the region and normalize
-    return ngs.Integrate(property, mesh.Materials(zone)) / surface_zone
-
-
+    try: order = max([mesh.GetCurveOrder(), results["info"]["fes"].components[0].globalorder + 1 , order_min])
+    except: order = max([mesh.GetCurveOrder(), results["info"]["fes"].globalorder + 1 , order_min])
+    
+    return ngs.Integrate(property, mesh.Materials(zone), order = order) / surface(zone, mesh)
 
 def magnetization_halbach(br: float = 1,
                           mu: float = 4e-7 * ngs.pi,
@@ -440,7 +471,7 @@ def solve_magnetoharmonic(
         
     # Normalize supplied currents by bundle volume
     Jcplx = {
-        bundle: supply[bundle] / ngs.Integrate(1, mesh.Materials(bundle))
+        bundle: supply[bundle] / surface(bundle, mesh)
         for bundle in bundles
     }
 
@@ -550,6 +581,351 @@ def solve_magnetoharmonic(
     tic = time()
     sol = ngs.GridFunction(fes)
     res = sol.vec.CreateVector()
+    if fix1dof:
+        sol.vec.data[ind] = a_dirichlet.vec[ind]
+        res.data = K*sol.vec - F
+    else:
+        res.data =  -F
+
+    if type(Kinv) != sp.linalg.SuperLU:
+        sol.vec.data -= Kinv * res
+    else:
+        spsol = Kinv.solve(res.FV().NumPy()[fes.FreeDofs()])
+        sol.vec.data.FV().NumPy()[fes.FreeDofs()] = - spsol
+    
+    t_solve = time() - tic
+
+    if verbose >= 1:
+        print(f"done in {t_solve*1000:.0f} ms")
+
+    # ------------------------------------------------------------
+    # Package results
+    # ------------------------------------------------------------
+    if verbose >= 1:
+        txt = "Pack the results... "
+        print(txt, *[""]*(len(txtref) - len(txt)), end="")
+
+    time_total = time() -t0
+    if type(trials) is list:
+        solution = {
+                "a": sol.components[0],
+                "E": {
+                    bundle: sol.components[i + 1]
+                    for i, bundle in enumerate(bundles)
+                }
+                }
+    else:
+        solution = {
+                "a": sol,
+                "E": {}}
+    results = {
+        "solution": solution,
+        "trial": {"a": a, "E": E},
+        "test": {"a": a_, "E": E_},
+        "bundles": bundles,
+        "info": {
+            "fes": fes,
+            "reluctivity": reluctivity,
+            "magnetization": magnetization,
+            "frequency": frequency,
+            "supply": supply,
+            "conductivity": conductivity,
+            "Kinv": Kinv,
+            "K" : K,
+            "F": -res,
+            "solver": solver,
+            "walltime" : {"fes": t_fes, 
+                          "assembly": t_assembly, 
+                          "decomposition": t_decomposition, 
+                          "rhs": t_rhs, 
+                          "solve": t_solve,
+                          "total":time_total}
+            },
+        }  
+
+    if verbose >= 1:
+        print(f"total time: {time_total:.3f} s")
+        print(f"-- END MAGNETOHARMONIC SOLVER --")
+       
+    return results
+
+
+def solve_magnetoharmonic2(
+    fes: ngs.FESpace,  # finite element space
+    reluctivity: ngs.GridFunction | ngs.CoefficientFunction,  # magnetic reluctivity
+    magnetization: ngs.GridFunction | ngs.CoefficientFunction,  # complex magnetization
+    frequency: float,   # electrical frequency
+    supply: dict, # supply of electrical conductors
+    conductivity: ngs.GridFunction | ngs.CoefficientFunction | float = 6e7,    # conductivity
+    Kinv=None,  # optional precomputed inverse system matrix
+    solver: str = "pardiso",  # linear solver type
+    bonus_intorder : int = 3,       # bonus order of integration in the assembly
+    verbose: int = 0,  # for controlling print statements
+    taskmanager: bool = True, # for paralelizing assembly process
+    # Slot model - mixed boundary conditions
+    # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+    #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+    robin_bnd   : str = None, # Boundary name where apply mixed condition
+    robin_coeff : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+    a_dirichlet : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # non-zero Dirichlet, in fes
+    h_tangential   : ngs.GridFunction | ngs.CoefficientFunction | float = 0,  # Neumann trace
+    fix1dof : bool = False,   # if true, fix one dof to a_dirichlet value
+    ) -> dict:
+    """
+    Solve a linear magneto-quasistatic problem in the frequency domain.
+
+    This function assembles and solves the finite-element formulation of a
+    time-harmonic magneto-quasistatic problem using the magnetic vector
+    potential. Eddy currents in electrical conductors are modeled through a
+    coupled formulation with Lagrange multipliers enforcing prescribed bundle
+    currents. The solver supports permanent magnet excitation, spatially varying
+    material properties, optional mixed (Robin) boundary conditions, and
+    pre-factorized system matrices for efficient repeated simulations.
+
+    Parameters
+    ----------
+    fes : ngs.FESpace
+        Finite element space for the magnetic vector potential.
+
+    reluctivity : ngs.GridFunction or ngs.CoefficientFunction
+        Magnetic reluctivity (1/μ). May vary spatially. Magnetic materials are
+        assumed linear.
+
+    magnetization : ngs.GridFunction or ngs.CoefficientFunction
+        Complex-valued magnetization source term, typically representing
+        rotating permanent magnets.
+
+    frequency : float
+        Electrical excitation frequency [Hz].
+
+    supply : dict
+        Electrical supply of the conducting bundles. Keys correspond to 
+        conductor bundle names and values to the imposed complex currents [A].
+
+    conductivity : float or ngs.GridFunction or ngs.CoefficientFunction, optional
+        Electrical conductivity distribution.
+
+    Kinv : optional
+        Precomputed inverse (or factorization) of the system matrix. Providing
+        this argument skips assembly and factorization of the stiffness matrix,
+        greatly accelerating repeated solves with unchanged material properties.
+
+    solver : str, optional
+        Direct solver backend used to factorize the system matrix (default:
+        ``"pardiso"``).
+
+    bonus_intorder : int, optional
+        Additional integration order used for conductivity and magnetization
+        terms to improve quadrature accuracy.
+
+    verbose : int, optional
+        Verbosity level. Values greater than zero print timing information for
+        each stage of the solve.
+
+    taskmanager : bool, optional
+        If True, assembles the finite element matrices using NGSolve's
+        ``TaskManager`` for parallel execution.
+
+    robin_bnd : str, optional
+        Name of the boundary where mixed (Robin) boundary conditions are applied.
+        If ``None``, the default natural (Neumann) boundary condition is used.
+
+    robin_coeff : float or ngs.GridFunction or ngs.CoefficientFunction, optional
+        Robin coefficient α satisfying
+
+            α a + (1-α) ν curl(a) x n
+            = α a_dirichlet + (1-α) h_tangential.
+
+        Typical α values are:
+        - 0 : pure Neumann condition
+        - values approaching 1 : approximate Dirichlet condition.
+
+    a_dirichlet : float or ngs.GridFunction or ngs.CoefficientFunction, optional
+        Prescribed magnetic vector potential used in the Robin boundary
+        condition.
+
+    h_tangential : float or ngs.GridFunction or ngs.CoefficientFunction, optional
+        Prescribed tangential magnetic field trace used in the Robin boundary
+        condition.
+
+    fix1dof : bool, optional
+        If True, fixes one degree of freedom of the magnetic vector potential to
+        remove the null space associated with pure Neumann problems.
+
+    Returns
+    -------
+    results : dict
+        Dictionary containing
+
+        ``"solution"``
+            Solution fields:
+            - ``"a"``: magnetic vector potential.
+            - ``"E"``: bundle time integral of electric potentials.
+
+        ``"test"``
+            Test functions used in the weak formulation.
+
+        ``"bundles"``
+            Names of the conducting bundles.
+
+        ``"info"``
+            Simulation metadata including the finite element space, material
+            properties, excitation, solver information, cached matrix inverse,
+            and execution times.
+
+    Notes
+    -----
+    - The formulation assumes linear magnetostatics in the frequency domain.
+    - Eddy currents are modeled only inside conducting bundles.
+    - Total bundle currents are imposed using Lagrange multipliers.
+    - Reusing ``Kinv`` is highly recommended for repeated simulations with
+    varying currents or magnetization, as it avoids reassembling and
+    refactorizing the system matrix.
+    - When ``fix1dof=True``, one degree of freedom is constrained to eliminate
+    the singularity associated with pure Neumann boundary conditions.
+    """
+    
+    if verbose >= 1:
+        print(f"-- START MAGNETOHARMONIC SOLVER --")
+        print(f"Solver : {solver.lower()}")
+        
+    t0 = time()
+    jw = 1j * 2 * ngs.pi * frequency
+    K = None
+    txtref = f"Matrix decomposition with {solver}... "
+    
+    if verbose >= 1:
+        txt = "Setup function space... "
+        print(txt, *[""]*(len(txtref)-len(txt)), end="")
+        
+    # Identify conductor bundles
+    bundles = supply.keys()
+
+    mesh = fes.mesh
+    if fix1dof:
+        dummy = ngs.GridFunction(fes)
+        dummy.Set(1)
+        ind = np.nonzero(dummy.vec.FV().NumPy())[0][0]
+        fes.FreeDofs()[ind] = False
+        
+    # Normalize supplied currents by bundle volume
+    Jcplx = {
+        bundle: supply[bundle] / surface(bundle, mesh)
+        for bundle in bundles
+    }
+
+    # Extend FE space with Lagrange multipliers (bundle constraints)
+    for _ in bundles:
+        fes *= ngs.NumberSpace(mesh, complex=True)
+
+    # Define trial and test functions
+    trials = fes.TrialFunction()
+    tests = fes.TestFunction()
+    if type(trials) is list:
+        a, a_ = trials[0], tests[0]
+    else:
+        a, a_ = trials, tests
+
+    E = {bundle: trials[i + 1] for i, bundle in enumerate(bundles)}
+    E_ = {bundle: tests[i + 1] for i, bundle in enumerate(bundles)}
+
+    t_fes = time() - t0
+    
+    if verbose >= 1:
+        print(f"done in {t_fes*1000:.0f} ms")
+
+    # ------------------------------------------------------------
+    # Assemble system matrix
+    # ------------------------------------------------------------
+    t_assembly = 0
+    t_decomposition = 0
+    if (Kinv is None) or fix1dof:
+        tic = time()
+        if verbose >= 1:
+            txt = "Assemble matrix... "
+            print(txt, *[""]*(len(txtref) - len(txt)), end="")
+
+        bf = Curl(a_) * reluctivity * Curl(a) * ngs.dx
+        
+        # Optional Robin term
+        if robin_bnd is not None:
+            bf += a_ * robin_coeff / (1-robin_coeff) * a * ngs.ds(robin_bnd)
+
+        # Eddy-current + constraint coupling in each bundle
+        for bundle in bundles:
+            bf += a_ * conductivity * jw * (a + E[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            bf += E_[bundle] * conductivity * jw * (a + E[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+
+        # Assemble matrix
+        if taskmanager:
+            with ngs.TaskManager():
+                K = ngs.BilinearForm(bf, symmetric = True).Assemble().mat
+        else:
+            K = ngs.BilinearForm(bf, symmetric = True).Assemble().mat
+
+        t_assembly = time() - tic
+        
+        if verbose >= 1:
+            print(f"done in {t_assembly*1000:.0f} ms")
+
+        
+        # Factorize system
+        if verbose >= 1:
+            txt = txtref
+            print(txtref, end="")
+    
+        tic = time()
+        if (Kinv is None):
+            if solver.lower() != "superlu":
+                Kinv = K.Inverse(fes.FreeDofs(), inverse=solver)
+            else:
+                rows,cols,vals = K.COO()
+                Ksp =  sp.csc_matrix((vals,(rows,cols)))
+                Ksp = Ksp[fes.FreeDofs(),:][:,fes.FreeDofs()]
+                Kinv = sp.linalg.splu(Ksp)          
+                            
+        t_decomposition = time() - tic
+        
+        if verbose >= 1:
+            print(f"done in {t_decomposition*1000:.0f} ms")
+
+    # ------------------------------------------------------------
+    # Assemble right-hand side
+    # ------------------------------------------------------------
+    if verbose >= 1:
+        txt = "Assemble right hand side... "
+        print(txt, *[""]*(len(txtref) - len(txt)), end="")
+    tic = time()
+    lf = Curl(a_) * magnetization * ngs.dx(bonus_intorder = bonus_intorder)
+    
+    # Optional Robin term
+    if robin_bnd is not None:
+        lf += robin_coeff / (1-robin_coeff) * a_dirichlet * a_ * ngs.ds(robin_bnd)
+        lf += h_tangential * a_ * ngs.ds(robin_bnd)
+     
+    for bundle in bundles:
+        lf += Jcplx[bundle] * a_ * ngs.dx(bundle)
+
+    if taskmanager:
+        with ngs.TaskManager():
+            F = ngs.LinearForm(lf).Assemble().vec
+    else:
+        F = ngs.LinearForm(lf).Assemble().vec
+
+    t_rhs = time() - tic
+    if verbose >= 1:
+        print(f"done in {t_rhs*1000:.0f} ms")
+
+    # ------------------------------------------------------------
+    # Solve linear system
+    # ------------------------------------------------------------
+    if verbose >= 1:
+        txt = "Solve the problem... "
+        print(txt, *[""]*(len(txtref) - len(txt)), end="")
+    tic = time()
+    sol = ngs.GridFunction(fes)
+    res = sol.vec.CreateVector()
+
     if fix1dof:
         sol.vec.data[ind] = a_dirichlet.vec[ind]
         res.data = K*sol.vec - F
@@ -1052,6 +1428,107 @@ def electric_field(results: dict,              # result of solve_magnetoharmonic
 
     return electric_field * sigma / (sigma + 1e-300)
 
+def electric_field_eddy_current(results: dict,              # result of solve_magnetoharmonic
+                                type: str = "solution"      # "solution" or "test" for directional derivative
+                                ) -> ngs.CoefficientFunction:
+    """
+    Compute the electric field due to Eddy current in conducting regions 
+    by post-processing.
+
+    This function reconstructs the complex electric field from the magnetic
+    vector potential and bundle-wise electric potentials obtained from a
+    magneto-harmonic finite element solve.
+
+    Parameters
+    ----------
+    results : dict
+        Output dictionary from `solve_magnetoharmonic`, containing the
+        solution fields and metadata.
+
+    type : str, optional
+        Specifies which fields to use:
+        - "solution": use primal solution fields
+        - "test": use adjoint/test fields for sensitivity analysis
+
+    Returns
+    -------
+    ngs.CoefficientFunction
+        Complex electric field distribution, restricted to conducting regions.
+
+    Notes
+    -----
+    - The eddy current electric field is computed as:
+        E = -jω (A - e_bundle)
+    - A conductivity mask is applied to restrict the field to conductors
+      and avoid division by zero.
+    """
+
+    jw = 1j * 2 * ngs.pi * results["info"]["frequency"]
+
+    # Time-harmonic contribution from magnetic vector potential
+
+    mesh = results["info"]["fes"].mesh
+    E_eddy_current = -jw * results[type]["a"]
+
+    # Add bundle electric potential contributions
+    E_eddy_current = 0
+    for bundle in results[type]["E"].keys():
+        E = results[type]["E"][bundle]
+        E_eddy_current += -jw * (E + results[type]["a"])* mesh.MaterialCF({bundle: 1})
+
+    sigma = results["info"]["conductivity"]
+
+    return E_eddy_current * sigma / (sigma + 1e-300)
+
+def electric_field2(results: dict,              # result of solve_magnetoharmonic
+                    type: str = "solution",      # "solution" or "test" for directional derivative
+                    E_eddy : ngs.CoefficientFunction = None
+                   ) -> ngs.CoefficientFunction:
+    """
+    Compute the electric field in conducting regions by post-processing.
+
+    This function reconstructs the complex electric field from the magnetic
+    vector potential and bundle-wise electric potentials obtained from a
+    magneto-harmonic finite element solve.
+
+    Parameters
+    ----------
+    results : dict
+        Output dictionary from `solve_magnetoharmonic`, containing the
+        solution fields and metadata.
+
+    type : str, optional
+        Specifies which fields to use:
+        - "solution": use primal solution fields
+        - "test": use adjoint/test fields for sensitivity analysis
+
+    Returns
+    -------
+    ngs.CoefficientFunction
+        Complex electric field distribution, restricted to conducting regions.
+
+    Notes
+    -----
+    - The electric field is computed as:
+        E = Js / sigma + electric_field_eddy_current
+    """
+    E = 0
+    if E_eddy is None:
+        E +=  electric_field_eddy_current(results = results,
+                                         type = type)
+    else:
+        E += E_eddy
+
+    mesh = results["info"]["fes"].mesh
+    sigma = results["info"]["conductivity"]
+
+    # Add bundle electric potential contributions
+    for bundle in results[type]["E"].keys():
+        Js = results["info"]["supply"][bundle] / surface(bundle, mesh)
+        E += (Js * sigma / (sigma + 1e-100)**2) * mesh.MaterialCF({bundle: 1}) 
+
+    return E
+
 def current_density(results: dict,          # result of solve_magnetoharmonic
                     type: str = "solution"  # "solution" or "test" for directional derivative
                     ) -> ngs.CoefficientFunction:
@@ -1081,6 +1558,36 @@ def current_density(results: dict,          # result of solve_magnetoharmonic
     sigma = results["info"]["conductivity"]
 
     return sigma * electric_field(results, type)
+
+def current_density2(results: dict,          # result of solve_magnetoharmonic
+                    type: str = "solution"  # "solution" or "test" for directional derivative
+                    ) -> ngs.CoefficientFunction:
+    """
+    Compute the electric current density by post-processing.
+
+    This function evaluates the conductive current density from the electric
+    field obtained in a magneto-harmonic finite element simulation.
+
+    Parameters
+    ----------
+    results : dict
+        Output dictionary from `solve_magnetoharmonic`, containing solution
+        fields and material properties.
+
+    type : str, optional
+        Specifies which field set to use:
+        - "solution": use primal solution fields
+        - "test": use test fields for sensitivity analysis
+
+    Returns
+    -------
+    ngs.CoefficientFunction
+        Complex current density field J = σ E (local Ohm's law)
+    """
+
+    sigma = results["info"]["conductivity"]
+
+    return sigma * electric_field2(results, type)
 
 def joule_losses(results : dict) -> float:
     """
@@ -1113,6 +1620,55 @@ def joule_losses(results : dict) -> float:
 
     # Current density from post-processing
     j = current_density(results)
+
+    # Conductivity with numerical safety offset
+    sigma = results["info"]["conductivity"] + 1e-300
+
+    mesh = results["info"]["fes"].mesh
+
+    # Quadrature order adapted to solution polynomial order
+    order = 2 * results["solution"]["a"].space.globalorder + 1
+
+    # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
+    P = ngs.Integrate(
+        ngs.InnerProduct(j, j).real / sigma,
+        mesh,
+        order=order) / 2
+
+    # Imaginary part is zero in theory; only real part is used explicitly
+    return P
+
+def joule_losses2(results : dict) -> float:
+    """
+    Compute the total Joule (ohmic) losses by post-processing.
+
+    This function evaluates the resistive power dissipation in conducting
+    regions based on the current density obtained from a magneto-harmonic
+    finite element simulation.
+
+    Parameters
+    ----------
+    results : dict
+        Output dictionary from `solve_magnetoharmonic`, containing solution
+        fields and material properties.
+
+    Returns
+    -------
+    float
+        Total Joule losses (time-averaged power dissipation).
+
+    Notes
+    -----
+    - The Joule losses are computed as:
+        P = 1/2 ∫_Ω (|J|² / σ) dx
+      where J is the complex current density.
+    - The factor 1/2 accounts for time-averaging in harmonic regime; 
+    we assume phasors modules are amplitude and not RMS values.
+    - A small regularization term is added to σ to avoid division by zero.
+    """
+
+    # Current density from post-processing
+    j = current_density2(results)
 
     # Conductivity with numerical safety offset
     sigma = results["info"]["conductivity"] + 1e-300
@@ -1205,7 +1761,7 @@ def average_torque(results : dict,
     mesh = results["info"]["fes"].mesh
 
     # Airgap normalization area
-    S = ngs.Integrate(1, mesh.Materials(airgap))
+    S = surface(airgap, mesh)
 
     # Magnetic flux density
     b = Curl(results["solution"]["a"])
