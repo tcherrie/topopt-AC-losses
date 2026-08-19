@@ -7,6 +7,7 @@ Functions defined here:
 - gfu2state                 (helper)
 - Curl                      (helper)
 - surface                   (helper)
+- integrate                 (helper)
 - average_property          (helper)
 - magnetization_halbach     (helper)
 - solve_magnetoharmonic     (main physical solvers)
@@ -45,6 +46,7 @@ import ngsolve as ngs
 import numpy as np
 from time import time
 import scipy.sparse as sp
+from re import match
 
 
 #%% Helpers
@@ -223,6 +225,44 @@ def surface(zone: str,
     """
     return ngs.Integrate(1, mesh.Materials(zone), order = mesh.GetCurveOrder())
 
+def integrate(property: ngs.GridFunction | ngs.CoefficientFunction,
+              results: dict,
+              zone: str = ".*",
+              order_min = 5,
+              ) -> float:
+    """
+    Compute the integral of a field over a given mesh region.
+
+    Parameters
+    ----------
+    property : ngs.GridFunction or ngs.CoefficientFunction
+        Field to be averaged over the domain.
+
+    results : dict
+        Simulation results dictionary containing at least the FESpace
+        and mesh information under `results["info"]["fes"]`.
+
+    zone : str, optional
+        Material or region selector (regex-style). Default is ".*" (whole domain).
+
+    Returns
+    -------
+    float
+        Spatial average of the given property over the selected zone.
+
+    Notes
+    -----
+    - The integration is performed using NGSolve integration utilities.
+    """
+
+    mesh = results["info"]["fes"].mesh
+
+    # Compute integral of the field over the region and normalize
+    try: order = max([mesh.GetCurveOrder(), 2*results["info"]["fes"].components[0].globalorder + 1 , order_min])
+    except: order = max([mesh.GetCurveOrder(), 2*results["info"]["fes"].globalorder + 1 , order_min])
+    
+    return ngs.Integrate(property, mesh.Materials(zone), order = order)
+
 def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
                      results: dict,
                      zone: str = ".*",
@@ -259,12 +299,7 @@ def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
     """
 
     mesh = results["info"]["fes"].mesh
-
-    # Compute integral of the field over the region and normalize
-    try: order = max([mesh.GetCurveOrder(), results["info"]["fes"].components[0].globalorder + 1 , order_min])
-    except: order = max([mesh.GetCurveOrder(), results["info"]["fes"].globalorder + 1 , order_min])
-    
-    return ngs.Integrate(property, mesh.Materials(zone), order = order) / surface(zone, mesh)
+    return integrate(property, results, zone, order_min) / surface(zone, mesh)
 
 def magnetization_halbach(br: float = 1,
                           mu: float = 4e-7 * ngs.pi,
@@ -904,7 +939,9 @@ def solve_magnetoharmonic2(
         lf += h_tangential * a_ * ngs.ds(robin_bnd)
      
     for bundle in bundles:
-        lf += Jcplx[bundle] * a_ * ngs.dx(bundle)
+        #lf += Jcplx[bundle] * a_ * ngs.dx(bundle)
+        Jdc = supply[bundle] * conductivity / ngs.Integrate(conductivity, mesh.Materials(bundle))
+        lf += Jdc * a_ * ngs.dx(bundle)
 
     if taskmanager:
         with ngs.TaskManager():
@@ -1321,6 +1358,180 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
     if verbose >=2 : print(f" ********************* END NEWTON ********************* ")  
     return gfu2state(state, result)
 
+
+
+def operator_magnetostatic(state : dict,
+                           type : str,
+                           t : float = 0,
+                           bonus_intorder : int = 3,
+                           # Slot model - mixed boundary conditions
+                           # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                           #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                           robin_bnd   : str = None, # Boundary name where apply mixed condition
+                           robin_coeff :  callable = lambda t: 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                           )-> ngs.comp.SumOfIntegrals:
+
+    reluctivity = state["info"]["reluctivity"]
+    a_ = state["test"]["a"]
+    a = state[type]["a"]
+
+    # Magnetostatic part
+    K = reluctivity(ngs.Norm(Curl(a))) * Curl(a) * Curl(a_) * ngs.dx(bonus_intorder = bonus_intorder)
+
+        #Optional Robin term
+    if robin_bnd is not None:
+        alpha = robin_coeff(t)
+        K += a_ * alpha / (1-alpha) * a * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
+
+    return K.Compile()
+
+def rhs_magnetostatic(state : dict,
+                      t : float = 0,
+                      js_flag = False,              # flag to consider supply as constant 
+                      bonus_intorder : int = 3,
+                      # Slot model - mixed boundary conditions
+                      # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                      #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                      robin_bnd   : str = None, # Boundary name where apply mixed condition
+                      robin_coeff :  callable = lambda t: 0,  # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                      a_dirichlet :  callable = lambda t: 0,   # non-zero Dirichlet, in fes
+                      h_tangential :  callable = lambda t: 0,  # Neumann trace
+                      )-> ngs.comp.SumOfIntegrals:
+
+    """ Right-hand side of asymmetric magnetoquasistatic formulation """
+
+    mesh = state["info"]["fes"].mesh
+    
+    magnetization = state["info"]["magnetization"]
+    supply = state["info"]["supply"]
+    bundles = supply.keys()
+
+    J = {bundle: supply[bundle](t) / surface(bundle, mesh)
+        for bundle in bundles}
+    
+    a_ = state["test"]["a"]
+
+    F = 0
+
+    # Eddy-current + constraint coupling in each bundle
+    if js_flag:
+        for bundle in bundles:
+            F += J[bundle] * a_ * ngs.dx(bundle)
+
+    else:
+        for bundle in bundles:
+            F += J[bundle] * a_ * ngs.dx(bundle)
+
+    # Optional Robin term
+    if robin_bnd is not None:
+        alpha = robin_coeff(t)
+        lf += alpha / (1-alpha) * a_dirichlet(t) * a_ * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
+        lf += h_tangential(t) * a_ * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
+
+    F.Compile()
+
+    F += magnetization(t) * Curl(a_) * ngs.dx(bonus_intorder = bonus_intorder)
+
+    return F # F.Compile() might not work here because of derivation of real part of complex magnetization
+
+
+def operator_magnetoquasistatic_time_domain(state : dict,
+                                            t : float,
+                                            dt : float,
+                                            type : str,
+                                            theta : float = 0.5,
+                                            bonus_intorder : int = 3,
+                                            # Slot model - mixed boundary conditions
+                                            # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                                            #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                                            robin_bnd   : str = None, # Boundary name where apply mixed condition
+                                            robin_coeff : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                                            )-> ngs.comp.SumOfIntegrals:
+    """ Operator of asymmetric magnetoquasistatic formulation """
+
+    conductivity = state["info"]["conductivity"]
+    e_ = state["test"]["e"]
+    a_ = state["test"]["a"]
+    eNew = state[type]["e"]
+    aNew = state[type]["a"]
+
+    K = 0
+    # Magnetostatic part
+    if theta >0:
+        K += theta * operator_magnetostatic(state = state, type = type,
+                                            t = t + dt,
+                                            bonus_intorder = bonus_intorder,
+                                            robin_bnd = robin_bnd,
+                                            robin_coeff = robin_coeff)
+
+    # Eddy-current + constraint coupling in each bundle
+    for bundle in state["info"]["supply"].keys():
+        K += conductivity * ( aNew/dt  + theta * eNew[bundle]) * (a_ + e_[bundle]) * ngs.dx(bundle, 
+                                                                                            bonus_intorder = bonus_intorder)
+
+    return K.Compile() 
+
+
+def rhs_magnetoquasistatic_time_domain(state : dict,
+                                       t : float,
+                                       dt : float,
+                                       theta : float = 0.5,
+                                       bonus_intorder : int = 3,
+                                       # Slot model - mixed boundary conditions
+                                       # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                                       #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                                       robin_bnd   : str = None, # Boundary name where apply mixed condition
+                                       robin_coeff : callable = lambda t: 0,     # robin_coeff(t) -> GridFunction or CoefficientFunction [0 = neumann, 1 = dirichlet); 
+                                       a_dirichlet : callable = lambda t: 0,     # a_dirichlet(t) -> GridFunction or CoefficientFunction (non-zero Dirichlet, in fes)
+                                       h_tangential : callable = lambda t: 0,    # h_tangential(t)->  GridFunction or CoefficientFunction (Neumann trace)
+                                       )-> ngs.comp.SumOfIntegrals:
+
+    """ Right-hand side of asymmetric magnetoquasistatic formulation """
+
+    conductivity = state["info"]["conductivity"]
+    supply = state["info"]["supply"]
+    bundles = supply.keys()
+
+    J = {bundle: lambda t: supply[bundle](t) / surface(bundle,  state["info"]["fes"].mesh)
+        for bundle in bundles}
+    
+    e_ = state["test"]["e"]
+    a_ = state["test"]["a"]
+    eOld = state["solution"]["e"]
+    aOld = state["solution"]["a"]
+
+    # Eddy-current coupling in each bundle
+    F = 0
+    for bundle in bundles:
+        F += conductivity * ( aOld/dt  - (1-theta) * eOld[bundle]) * (a_ + e_[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+
+    # Magnetostatic part
+    F += -(1-theta) * operator_magnetostatic(state = state, 
+                                            type = "solution",
+                                            t = t,
+                                            bonus_intorder = bonus_intorder,
+                                            robin_bnd = robin_bnd,
+                                            robin_coeff = robin_coeff)
+        
+    F.Compile()
+
+    F += (1-theta) * rhs_magnetostatic(state = state, t = t,
+                                      bonus_intorder = bonus_intorder,  
+                                      robin_bnd  = robin_bnd, 
+                                      robin_coeff  = robin_coeff,
+                                      a_dirichlet = a_dirichlet,
+                                      h_tangential = h_tangential)
+
+    F += theta * rhs_magnetostatic(state = state, t = t + dt,
+                                   bonus_intorder = bonus_intorder,
+                                   robin_bnd  = robin_bnd, 
+                                   robin_coeff  = robin_coeff,
+                                   a_dirichlet = a_dirichlet,
+                                   h_tangential = h_tangential)
+
+    return F
+
+
 #%% Post-processing
 
 
@@ -1471,10 +1682,9 @@ def electric_field_eddy_current(results: dict,              # result of solve_ma
     E_eddy_current = -jw * results[type]["a"]
 
     # Add bundle electric potential contributions
-    E_eddy_current = 0
     for bundle in results[type]["E"].keys():
         E = results[type]["E"][bundle]
-        E_eddy_current += -jw * (E + results[type]["a"])* mesh.MaterialCF({bundle: 1})
+        E_eddy_current += -jw * E* mesh.MaterialCF({bundle: 1})
 
     sigma = results["info"]["conductivity"]
 
@@ -1515,17 +1725,19 @@ def electric_field2(results: dict,              # result of solve_magnetoharmoni
     E = 0
     if E_eddy is None:
         E +=  electric_field_eddy_current(results = results,
-                                         type = type)
+                                          type = type)
     else:
         E += E_eddy
 
     mesh = results["info"]["fes"].mesh
     sigma = results["info"]["conductivity"]
 
-    # Add bundle electric potential contributions
-    for bundle in results[type]["E"].keys():
-        Js = results["info"]["supply"][bundle] / surface(bundle, mesh)
-        E += (Js * sigma / (sigma + 1e-100)**2) * mesh.MaterialCF({bundle: 1}) 
+    # Add DC contributions
+    if  type.lower() == "solution":
+        for bundle in results[type]["E"].keys():
+            I = results["info"]["supply"][bundle]
+            rho_avg = integrate(sigma, results, bundle)
+            E += I / rho_avg * mesh.MaterialCF({bundle: 1}) 
 
     return E
 
@@ -1589,7 +1801,8 @@ def current_density2(results: dict,          # result of solve_magnetoharmonic
 
     return sigma * electric_field2(results, type)
 
-def joule_losses(results : dict) -> float:
+def joule_losses(results : dict,
+                 zone : str = ".*") -> float:
     """
     Compute the total Joule (ohmic) losses by post-processing.
 
@@ -1632,13 +1845,14 @@ def joule_losses(results : dict) -> float:
     # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
     P = ngs.Integrate(
         ngs.InnerProduct(j, j).real / sigma,
-        mesh,
+        mesh.Materials(zone),
         order=order) / 2
 
     # Imaginary part is zero in theory; only real part is used explicitly
     return P
 
-def joule_losses2(results : dict) -> float:
+def joule_losses2(results : dict,
+                  zone : str = ".*") -> float:
     """
     Compute the total Joule (ohmic) losses by post-processing.
 
@@ -1668,7 +1882,7 @@ def joule_losses2(results : dict) -> float:
     """
 
     # Current density from post-processing
-    j = current_density2(results)
+    #j = current_density2(results)
 
     # Conductivity with numerical safety offset
     sigma = results["info"]["conductivity"] + 1e-300
@@ -1678,14 +1892,37 @@ def joule_losses2(results : dict) -> float:
     # Quadrature order adapted to solution polynomial order
     order = 2 * results["solution"]["a"].space.globalorder + 1
 
+    """
+    expr = ngs.InnerProduct(j, j).real / sigma
+    expr.Compile()
+
     # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
     P = ngs.Integrate(
-        ngs.InnerProduct(j, j).real / sigma,
-        mesh,
+        expr,
+        mesh.Materials(zone),
         order=order) / 2
+    """
+
+    # More efficient alternative
+
+    E =  electric_field_eddy_current(results = results)
+
+    Pac = ngs.Integrate(
+            ngs.InnerProduct(E,E).real * sigma,
+            mesh.Materials(zone),
+            order=order) / 2
+
+    Pdc =0
+    I = results["info"]["supply"]
+    for bundle in results["bundles"]:
+        if match(zone, bundle):
+            #print(bundle)
+            edc_loc = I[bundle] / ngs.Integrate(sigma, mesh.Materials(bundle))
+            Pdc +=  ngs.Integrate((edc_loc*edc_loc.conjugate()).real * sigma, mesh.Materials(bundle), order = mesh.GetCurveOrder()) / 2
 
     # Imaginary part is zero in theory; only real part is used explicitly
-    return P
+
+    return Pac + Pdc
 
 def matrix_arkkio() -> ngs.CoefficientFunction :
     """
