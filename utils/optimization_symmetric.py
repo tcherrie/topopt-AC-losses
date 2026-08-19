@@ -39,6 +39,7 @@ from time import time
 import matplotlib.pyplot as plt
 import numpy as np
 import ngsolve as ngs
+from re import match
 
 from ngsolve.webgui import Draw
 from copy import copy
@@ -389,7 +390,8 @@ def plot_taylor_test(H :                np.ndarray,
 
 def solve_adjoint(results   : dict,    # structured output from physics.solve_magnetoharmonic
                   df        : callable,# function (input "results", output ngsolve symbolic expression)
-                  verbose : int = 0    # verbosity level
+                  verbose : int = 0,    # verbosity level,
+                  taskmanager : bool = False,
                   ) -> dict:
     """
     Solve the adjoint problem associated with given finite-element state 
@@ -446,7 +448,11 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
     # Assemble system vector
     if verbose >= 1: print("Assembling adjoint right-hand side... ", end = "")
     t0 = time()
-    F = F.Assemble().vec
+    if taskmanager:
+        with ngs.TaskManager():
+            F = F.Assemble().vec
+    else:
+        F = F.Assemble().vec
     t1 = time()
     if verbose >= 1: print(f"done in {(t1-t0)*1000 : .0f} ms")
 
@@ -501,7 +507,7 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
 
 def dd_joule_losses(results : dict,          
                     slot    : str   = "slot.*",
-                    bonus_intorder : int = 3
+                    bonus_intorder : int = 3,
                     ) -> ngs.comp.SumOfIntegrals :
     """
     Compute the directional derivative of Joule losses.
@@ -536,17 +542,28 @@ def dd_joule_losses(results : dict,
     - The result is expressed as a finite-element integral form.
     """
 
-    # Current density for primal (solution) state
-    j = current_density(results, type="solution")
+    # Electrical conductivity
+    sigma = results["info"]["conductivity"]
 
-    # Current density for perturbation (test) state
-    j_ = current_density(results, type="test")
+    expr = 0
+    a = results["solution"]["a"]
+    a_ = results["test"]["a"]
+    jw = 1j * 2 * ngs.pi * results["info"]["frequency"]
+    for bundle in results["bundles"]:
+        if match(slot, bundle):
+            e = results["solution"]["E"][bundle]
+            e_ = results["test"]["E"][bundle]
+            expr += ngs.InnerProduct(jw * a, jw *  a_) * sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            expr += ngs.InnerProduct(jw * e, jw *  e_) * sigma * ngs.dx(bundle)
+            expr += ngs.InnerProduct(jw * a, jw *  e_) * sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            expr += ngs.InnerProduct(jw * e, jw *  a_) * sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+    expr.Compile()
 
-    # Electrical conductivity (regularized to avoid division by zero)
-    sigma = results["info"]["conductivity"] + 1e-300
-
-    # Returns the directional derivative of losses w.r.t the state
-    return ngs.InnerProduct(j, j_) / sigma * ngs.dx(slot, bonus_intorder = bonus_intorder)
+    # Equivalent to but faster than
+    # j = current_density(results, type="solution")
+    # j_ = current_density(results, type="test")
+    # expr = ngs.InnerProduct(j, j_) / sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+    return expr
 
 
 def dd_joule_losses2(results : dict,          
@@ -585,18 +602,36 @@ def dd_joule_losses2(results : dict,
       division by zero.
     - The result is expressed as a finite-element integral form.
     """
-
-    # Current density for primal (solution) state
-    j = current_density2(results, type="solution")
-
-    # Current density for perturbation (test) state
-    j_ = current_density2(results, type="test")
-
-    # Electrical conductivity (regularized to avoid division by zero)
+    # Electrical conductivity
     sigma = results["info"]["conductivity"] + 1e-300
 
     # Returns the directional derivative of losses w.r.t the state
-    return ngs.InnerProduct(j, j_) / sigma * ngs.dx(slot, bonus_intorder = bonus_intorder)
+    expr = 0
+
+    a = results["solution"]["a"]
+    a_ = results["test"]["a"]
+    I = results["info"]["supply"]
+    jw = 1j * 2 * ngs.pi * results["info"]["frequency"]
+    for bundle in results["bundles"]:
+        if match(slot, bundle):
+            e = results["solution"]["E"][bundle]
+            e_ = results["test"]["E"][bundle]
+            avg_rho = 1/integrate(sigma, results, bundle)
+            expr += ngs.InnerProduct(jw * a, jw *  a_) * sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            expr += ngs.InnerProduct(jw * e, jw *  e_) * sigma * ngs.dx(bundle)
+            expr += ngs.InnerProduct(jw * a, jw *  e_) * sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            expr += ngs.InnerProduct(jw * e, jw *  a_) * sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            expr += ngs.InnerProduct(ngs.CF(avg_rho*I[bundle]), -jw *  e_) * sigma * ngs.dx(bundle)
+            expr += ngs.InnerProduct(ngs.CF(avg_rho*I[bundle]), -jw *  a_) * sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+
+    expr.Compile()
+
+    # Equivalent to but faster than
+    # j = current_density(results, type="solution")
+    # j_ = current_density(results, type="test")
+    # expr = ngs.InnerProduct(j, j_) / sigma * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+
+    return expr
 
 def partiald_joule_losses(results :     dict, 
                           adjoint :     dict, 
@@ -604,6 +639,7 @@ def partiald_joule_losses(results :     dict,
                           wrt     :     str ="conductivity", 
                           slot    :     str = "slot.*",
                           bonus_intorder : int = 3,
+                          taskmanager : bool = False
                           ) -> ngs.LinearForm:
     """
     Compute the partial Fréchet derivative of Joule losses.
@@ -646,7 +682,7 @@ def partiald_joule_losses(results :     dict,
     """
 
     # Initialize weak form
-    df = ngs.LinearForm(test.space)
+    expr = 0
 
     if wrt.lower() == "conductivity":
 
@@ -658,18 +694,29 @@ def partiald_joule_losses(results :     dict,
 
         # Contribution from conductor bundles
         for bundle in adjoint["bundles"]:
-            df += ngs.InnerProduct(
-                pa + adjoint["solution"]["E"][bundle],
-                E
-                ).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            if match(slot, bundle):
+                expr += ngs.InnerProduct(
+                    pa + adjoint["solution"]["E"][bundle],
+                    E
+                    ).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
 
         # Bulk slot contribution
-        df += (ngs.InnerProduct(E, E)).real / 2 * test * ngs.dx(slot, bonus_intorder = bonus_intorder)
+        expr += (ngs.InnerProduct(E, E)).real / 2 * test * ngs.dx(slot, bonus_intorder = bonus_intorder)
+
+    expr.Compile()
+
+    df = ngs.LinearForm(expr)
 
     # elif wrt.lower() == "resistivity":
     #     TODO
 
-    return df.Assemble()
+    if taskmanager:
+        with ngs.TaskManager():
+            df.Assemble()  
+    else:
+        df.Assemble()
+
+    return df
 
 def partiald_joule_losses2(results :     dict, 
                           adjoint :     dict, 
@@ -677,6 +724,7 @@ def partiald_joule_losses2(results :     dict,
                           wrt     :     str ="conductivity", 
                           slot    :     str = "slot.*",
                           bonus_intorder : int = 3,
+                          taskmanager : bool = False
                           ) -> ngs.LinearForm:
     """
     Compute the partial Fréchet derivative of Joule losses.
@@ -719,7 +767,7 @@ def partiald_joule_losses2(results :     dict,
     """
 
     # Initialize weak form
-    df = ngs.LinearForm(test.space)
+    expr = 0
 
     #mesh = results["info"]["fes"].mesh
     #supply = results["info"]["supply"]
@@ -737,39 +785,50 @@ def partiald_joule_losses2(results :     dict,
         pa = adjoint["solution"]["a"]
 
         for bundle in adjoint["bundles"]:
-            # DC contribution to account for the dependance of Jdc = I*sigma / int(sigma) with sigma
-            intSigma = integrate(sigma, results, bundle)
-            df += - ngs.InnerProduct(pa, I[bundle] / intSigma).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
-            intPaISigma = integrate(ngs.InnerProduct(pa, I[bundle] / intSigma ** 2 * sigma), results, bundle)
-            df += intPaISigma.real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
-            # AC contribution from Lagrangian
-            df += ngs.InnerProduct(pa + adjoint["solution"]["E"][bundle], -E_eddy).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
-            
-            # contribution from objective function
-            # p = sigma * E²/2 =sigma * (Edc + Eac)² /2 = sigma * (Edc²/2 + Edc Eac/2 +  Eac Edc/2 + Eac²/2)
-            # Eac = jw (a + e) independant of sigma
-            # p'(sigma') = [AC]  E²/2 * sigma' +  [DC] sigma * (Edc²/2 + Edc Eac)'
-            # AC term (easy one)
-            df += (ngs.InnerProduct(E_total, E_total)).real / 2 * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
-            # DC term
-            # Edc = I/int(sigma) depends on sigma
-            # (Edc²/2 + Edc Eac/2 +  Eac Edc/2)' = <Edc, Edc'(sigma')> + 1/2<Eac, Edc'(sigma') > + 1/2<Edc'(sigma'), Eac > 
-            # =  <(Edc + Re(Eac) ), Edc'(sigma')> = <(Edc + Re(Eac), Edc'(sigma')>
-            # = <(Edc + Re(Eac) ), Edc'(sigma')> = <(Edc + Re(Eac), Edc'(sigma')>
-            # int(<Edc'(sigma'), Edc + Re(Eac)> sigma) = int( <- I/int(sigma)² int(sigma'), Edc + Re(Eac)> sigma) =  - I/int(sigma)² int(<sigma, Edc + Re(Eac)>) int(sigma') 
-            intEI = integrate(sigma * ngs.InnerProduct(E_total, I[bundle]/intSigma**2), results, bundle)
-            df += - intEI.real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+            if match(slot, bundle):
+                # DC contribution to account for the dependance of Jdc = I*sigma / int(sigma) with sigma
+                intSigma = integrate(sigma, results, bundle)
+                expr += - ngs.InnerProduct(pa, I[bundle] / intSigma).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+                intPaISigma = integrate(ngs.InnerProduct(pa, I[bundle] / intSigma ** 2 * sigma), results, bundle)
+                expr += intPaISigma.real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+                # AC contribution from Lagrangian
+                expr += ngs.InnerProduct(pa + adjoint["solution"]["E"][bundle], -E_eddy).real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+                
+                # contribution from objective function
+                # p = sigma * E²/2 =sigma * (Edc + Eac)² /2 = sigma * (Edc²/2 + Edc Eac/2 +  Eac Edc/2 + Eac²/2)
+                # Eac = jw (a + e) independant of sigma
+                # p'(sigma') = [AC]  E²/2 * sigma' +  [DC] sigma * (Edc²/2 + Edc Eac)'
+                # AC term (easy one)
+                expr += (ngs.InnerProduct(E_total, E_total)).real / 2 * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+                # DC term
+                # Edc = I/int(sigma) depends on sigma
+                # (Edc²/2 + Edc Eac/2 +  Eac Edc/2)' = <Edc, Edc'(sigma')> + 1/2<Eac, Edc'(sigma') > + 1/2<Edc'(sigma'), Eac > 
+                # =  <(Edc + Re(Eac) ), Edc'(sigma')> = <(Edc + Re(Eac), Edc'(sigma')>
+                # = <(Edc + Re(Eac) ), Edc'(sigma')> = <(Edc + Re(Eac), Edc'(sigma')>
+                # int(<Edc'(sigma'), Edc + Re(Eac)> sigma) = int( <- I/int(sigma)² int(sigma'), Edc + Re(Eac)> sigma) =  - I/int(sigma)² int(<sigma, Edc + Re(Eac)>) int(sigma') 
+                intEI = integrate(sigma * ngs.InnerProduct(E_total, I[bundle]/intSigma**2), results, bundle)
+                expr += - intEI.real * test * ngs.dx(bundle, bonus_intorder = bonus_intorder)
     # elif wrt.lower() == "resistivity":
     #     TODO
 
-    return df.Assemble()
+    expr.Compile()
+    df = ngs.LinearForm(expr)
+
+    if taskmanager:
+        with ngs.TaskManager():
+            df.Assemble()  
+    else:
+        df.Assemble()
+
+    return df
 
 def d_joule_losses(results  : dict, 
                    val      : ngs.GridFunction, 
                    adjoint  : dict = None, 
                    wrt      : str  ="conductivity",
                    slot    : str = "slot.*",
-                   bonus_intorder : int = 3
+                   bonus_intorder : int = 3,
+                   taskmanager : bool = False,
                    ) -> ngs.LinearForm:
     """
     Compute the total Fréchet derivative of Joule losses.
@@ -817,7 +876,8 @@ def d_joule_losses(results  : dict,
 
         # Solve adjoint system if not provided
         if adjoint is None:
-            adjoint = solve_adjoint(results, dd_joule_losses)
+            dd = lambda dico: dd_joule_losses(dico, slot=slot, bonus_intorder=bonus_intorder)
+            adjoint = solve_adjoint(results, dd, taskmanager = taskmanager)
 
         # Test function in design space
         test = val.space.TestFunction()
@@ -828,7 +888,8 @@ def d_joule_losses(results  : dict,
                                    test=test,
                                    wrt="conductivity",
                                    slot=slot,
-                                   bonus_intorder = bonus_intorder)
+                                   bonus_intorder = bonus_intorder,
+                                   taskmanager = taskmanager)
 
     # elif wrt.lower() == "resistivity":
     #     TODO
@@ -841,7 +902,8 @@ def d_joule_losses2(results  : dict,
                    adjoint  : dict = None, 
                    wrt      : str  ="conductivity",
                    slot    : str = "slot.*",
-                   bonus_intorder : int = 3
+                   bonus_intorder : int = 3,
+                   taskmanager : bool = False
                    ) -> ngs.LinearForm:
     """
     Compute the total Fréchet derivative of Joule losses.
@@ -889,7 +951,8 @@ def d_joule_losses2(results  : dict,
 
         # Solve adjoint system if not provided
         if adjoint is None:
-            adjoint = solve_adjoint(results, dd_joule_losses2)
+            dd = lambda dico: dd_joule_losses2(dico, slot=slot, bonus_intorder=bonus_intorder)
+            adjoint = solve_adjoint(results, dd, taskmanager=taskmanager)
 
         # Test function in design space
         test = val.space.TestFunction()
@@ -900,7 +963,8 @@ def d_joule_losses2(results  : dict,
                                    test=test,
                                    wrt="conductivity",
                                    slot=slot,
-                                   bonus_intorder = bonus_intorder)
+                                   bonus_intorder = bonus_intorder,
+                                   taskmanager = taskmanager)
 
     # elif wrt.lower() == "resistivity":
     #     TODO

@@ -1736,8 +1736,8 @@ def electric_field2(results: dict,              # result of solve_magnetoharmoni
     if  type.lower() == "solution":
         for bundle in results[type]["E"].keys():
             I = results["info"]["supply"][bundle]
-            rho_avg = integrate(sigma, results, bundle)
-            E += I / rho_avg * mesh.MaterialCF({bundle: 1}) 
+            rho_avg = 1/integrate(sigma, results, bundle)
+            E += rho_avg * I  * mesh.MaterialCF({bundle: 1}) 
 
     return E
 
@@ -1837,18 +1837,9 @@ def joule_losses(results : dict,
     # Conductivity with numerical safety offset
     sigma = results["info"]["conductivity"] + 1e-300
 
-    mesh = results["info"]["fes"].mesh
-
-    # Quadrature order adapted to solution polynomial order
-    order = 2 * results["solution"]["a"].space.globalorder + 1
-
     # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
-    P = ngs.Integrate(
-        ngs.InnerProduct(j, j).real / sigma,
-        mesh.Materials(zone),
-        order=order) / 2
+    P = integrate(ngs.InnerProduct(j, j).real / sigma, results, zone) / 2
 
-    # Imaginary part is zero in theory; only real part is used explicitly
     return P
 
 def joule_losses2(results : dict,
@@ -1877,10 +1868,7 @@ def joule_losses2(results : dict,
         P = 1/2 ∫_Ω (|J|² / σ) dx
       We integrate on each bundle separating DC and AC losses.
     """
-
-    # Conductivity with numerical safety offset
     sigma = results["info"]["conductivity"] + 1e-300
-    mesh = results["info"]["fes"].mesh
 
     E =  electric_field_eddy_current(results = results)
     E.Compile()
