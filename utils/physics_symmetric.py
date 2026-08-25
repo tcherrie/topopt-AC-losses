@@ -47,6 +47,7 @@ import numpy as np
 from time import time
 import scipy.sparse as sp
 from re import match
+from copy import copy
 
 
 #%% Helpers
@@ -74,7 +75,7 @@ def state2gfu(state : dict) -> ngs.GridFunction:
         ``state["solution"]["a"]``
             The magnetic vector potential GridFunction.
 
-        ``state["solution"]["e"]``
+        ``state["solution"]["E"]``
             A dictionary mapping conducting bundle names to their corresponding
             electric potential GridFunctions.
 
@@ -106,7 +107,7 @@ def state2gfu(state : dict) -> ngs.GridFunction:
     try:
         sol.components[0].vec.data = state["solution"]["a"].vec
         for i, bundle in enumerate(state["bundles"]):
-                    sol.components[i + 1].vec.data = state["solution"]["e"][bundle].vec
+                    sol.components[i + 1].vec.data = state["solution"]["E"][bundle].vec
     except:
         sol.vec.data = state["solution"]["a"].vec
     return sol
@@ -155,14 +156,29 @@ def gfu2state(gfu : ngs.GridFunction,
     If the GridFunction is not a compound space, the entire ``gfu`` is stored
     as the magnetic vector potential under ``state_copy["solution"]["a"]``.
     """
-    state_copy = state.copy()
+
+    fes = state["info"]["fes"]
+    sol = ngs.GridFunction(fes)
+    solution = {"a" : None, "E" : {}}
     try:
-        state_copy["solution"]["a"] = gfu.components[0]
+        sol.components[0].vec.data = gfu.components[0].vec
+        solution["a"] = sol.components[0]
         for i, bundle in enumerate(state["bundles"]):
-            state_copy["solution"]["e"][bundle] = gfu.components[i + 1]
+            sol.components[i + 1].vec.data = gfu.components[i + 1].vec
+            solution["E"][bundle] = sol.components[i + 1]
     except:
-        state_copy["solution"]["a"] = gfu
+        sol.vec.data = gfu.vec
+        solution["a"] = sol
+    state_copy = state.copy()
+    state_copy["solution"] = solution
     return state_copy
+
+
+def copy_state(state):
+    state_copy = state.copy()
+    gfu = state2gfu(state_copy)
+    return gfu2state(gfu, state_copy)
+
 
 
 def Curl(u: ngs.GridFunction | ngs.CoefficientFunction
@@ -843,12 +859,6 @@ def solve_magnetoharmonic2(
         ind = np.nonzero(dummy.vec.FV().NumPy())[0][0]
         fes.FreeDofs()[ind] = False
         
-    # Normalize supplied currents by bundle volume
-    Jcplx = {
-        bundle: supply[bundle] / surface(bundle, mesh)
-        for bundle in bundles
-    }
-
     # Extend FE space with Lagrange multipliers (bundle constraints)
     for _ in bundles:
         fes *= ngs.NumberSpace(mesh, complex=True)
@@ -1032,7 +1042,7 @@ def solve_magnetoharmonic2(
     return results
 
 
-def newton(residual : ngs.BilinearForm,                   # residual (written using a bilinearform, actually not bilinear)
+def newton(residual : ngs.BilinearForm | ngs.comp.SumOfIntegrals, # residual (written using a bilinearform, actually not bilinear)
            initial_state :  dict,                         # initial guess (state structure)
            # Inspection parameters
            verbose : int = 1,                             # verbosity level (0 - silent to 3 - detailed)
@@ -1045,10 +1055,11 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
            linesearch : bool = True,             # flag to enable line search (recommended)
            maxit_linesearch : int = 33,          # maximum iteration number within the line search
            minstep_linesearch : float = 1e-10,   # minimum step size allowed in the line search 
-           armijo_factor_linesearch : float = 0.1,      # Armijo coefficient in [0, 1) such that |residual(u-step*du)|² < residual²(u) - armijo_linesearch*step*(|residual(u)|²)'(du)
+           armijo_factor_linesearch : float = 0.1,      # Armijo coefficient in [0, 1) such that |residual(u-step*du)|² < residual²(u) - armijo_factor_linesearch*step*(|residual(u)|²)'(du)
            step_factor_linesearch : float = 0.5, # step size reduction factor in (0, 1) to reduce the step if too big
            taskmanager : bool = False,          # flag to enable parallelization with TaskManager during assembly
-           solver : str = "pardiso"              # method to solve the linear systems
+           solver : str = "pardiso",             # method to solve the linear systems
+           Kinv : ngs.BaseMatrix = None          # if not None, solve directly as a linear system (useful for explicit time schemes)
            ) -> dict:
     """
     Solve a nonlinear finite element problem using Newton's method with optional
@@ -1131,6 +1142,10 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
         ``"pardiso"``, uses NGSolve's direct solver interface. ``"superlu"`` uses
         SciPy's sparse LU factorization instead. 
         Default is ``"pardiso"``.
+    
+    Kinv : ngs.BaseMatrix, optional
+        If provided, solves directly sol =  Kinv * -residual. Useful to accelerate
+        explicit time schemes.
 
     Returns
     -------
@@ -1167,7 +1182,7 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
         ``"info"]["K"]``
             Final assembled linearized system matrix.
 
-        ``"info"]["wall_time"]``
+        ``"info"]["walltime"]``
             Dictionary containing timing information for the solver. Individual
             assembly and solve timings are currently not populated, while
             ``"total"`` contains the total wall-clock time.
@@ -1186,7 +1201,7 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
 
     # 1) Initialization
     tStart = time()
-    if verbose >= 2 : print(f"******************** START NEWTON ********************")
+    if verbose >= 2 : print(f"\n******************** START NEWTON ********************")
     if verbose >= 2 : print(f"Solver: {solver.lower()} | Multithreaded Assembly: {taskmanager}")
     if verbose >= 3 : print(f"Initializing  ..... ", end = "")
     state = state2gfu(initial_state)
@@ -1201,133 +1216,151 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
 
     decrement_list = []
     residual_list = []
-    if verbose >= 3 : print(f"done ({(time()-tStart) * 1000 :.2f} ms).")
-    if verbose >= 3 : print(f"     ---------------- Start loop  ----------------")
 
-    if taskmanager:
-        with ngs.TaskManager(): residual.Apply(state.vec, res)
-    else: residual.Apply(state.vec, res)
-    residual_list.append(np.sqrt(res2(res)))
-
-    # 2) Newton loop
-    for counter_newton in range(1,maxit_newton+1):
-        if verbose >= 2 : print(f" It {counter_newton} -------------------------------------------------")
-
-        # a) NaN check
-        if np.isnan(residual_list[-1]):
-            status = 4
-            if verbose >= 1 : 
-                print(f"❌ FAILURE: NaN detected !!")
-            break
-        # b) Compute residual and linearization
-        tStartAssembly = time()
+    if Kinv is not None:
         if verbose >= 3 : print(f" - Assembly ....... ", end = "")
         if taskmanager:
             with ngs.TaskManager():
-                residual.Apply(state.vec, res)
-                residual.AssembleLinearization(state.vec)
+                f = -ngs.LinearForm(residual).Assemble().vec
         else:
-            residual.Apply(state.vec, res)
-            residual.AssembleLinearization(state.vec)
-        if verbose >= 3 : print(f"done ({(time()-tStartAssembly) * 1000 :.2f} ms).")
+            f = -ngs.LinearForm(residual).Assemble().vec
+        state.vec.data = Kinv * - f
+        if verbose >= 3 : print(f"done ({(time()-tStart) * 1000 :.2f} ms).")
+        linear = True
+        counter_newton = 0
 
-        # c) Solve
-        tStartSolve = time()
-        if verbose >= 3 : print(f" - Solve .......... ", end = "")
-        if solver.lower() != "superlu":
-            Kinv  = residual.mat.Inverse(freedofs=fes.FreeDofs(), inverse = solver)  
-            descent.data = Kinv * res
-        else:
-            rows,cols,vals = residual.mat.COO()
-            Ksp =  sp.csc_matrix((vals,(rows,cols)))
-            Ksp = Ksp[fes.FreeDofs(),:][:,fes.FreeDofs()]
-            Kinv = sp.linalg.splu(Ksp)
-            spsol = Kinv.solve(res.FV().NumPy()[fes.FreeDofs()])
-            descent.data.FV().NumPy()[fes.FreeDofs()] = spsol
-        if verbose >= 3 : print(f"done ({(time()-tStartSolve) * 1000 :.2f} ms).")
+    else:
 
+        if type(residual) != ngs.comp.BilinearForm:
+            residual = ngs.BilinearForm(residual)
 
-        # d) Calculation of Newton's decrement
-        decrement = np.sqrt(abs(ngs.InnerProduct(res, descent)))
-        decrement_list.append(decrement)
+        if verbose >= 3 : print(f"done ({(time()-tStart) * 1000 :.2f} ms).")
+        if verbose >= 3 : print(f"     ---------------- Start loop  ----------------")
 
-        if verbose >= 2 : print(f" - Conv : ||residual|| = {residual_list[-1]:.4e} | decr = {decrement_list[-1] :.4e}")
+        if taskmanager:
+            with ngs.TaskManager(): residual.Apply(state.vec, res)
+        else: residual.Apply(state.vec, res)
+        residual_list.append(np.sqrt(res2(res)))
 
-        # e) Line search
-        if linesearch:
-            tStartLineSearch = time()
-            if verbose >= 2 : print(f" - Line search .... ")
-            step_linesearch = 1.0
-            counter_linesearch = 0
-            state_linesearch.data = state.vec - step_linesearch * descent
+        # 2) Newton loop
+        for counter_newton in range(1,maxit_newton+1):
+            if verbose >= 2 : print(f" It {counter_newton} -------------------------------------------------")
+
+            # a) NaN check
+            if np.isnan(residual_list[-1]):
+                status = 4
+                if verbose >= 1 : 
+                    print(f"❌ FAILURE: NaN detected !!")
+                break
+            # b) Compute residual and linearization
+            tStartAssembly = time()
+            if verbose >= 3 : print(f" - Assembly ....... ", end = "")
             if taskmanager:
                 with ngs.TaskManager():
-                    residual.Apply(state_linesearch, res_linesearch)
+                    residual.Apply(state.vec, res)
+                    residual.AssembleLinearization(state.vec)
             else:
-                residual.Apply(state_linesearch, res_linesearch)
-            res2_state = res2(res)
-            res2_linesearch = res2(res_linesearch)
-            if verbose >= 2 : print(f"   it {counter_linesearch} : ||residual|| = {np.sqrt(res2_linesearch) :.4e} | step = {step_linesearch :.2e}")
+                residual.Apply(state.vec, res)
+                residual.AssembleLinearization(state.vec)
+            if verbose >= 3 : print(f"done ({(time()-tStartAssembly) * 1000 :.2f} ms).")
 
-            while not (res2_linesearch < (1 - 2 * armijo_factor_linesearch * step_linesearch) * res2_state):
-                counter_linesearch += 1
-                step_linesearch *= step_factor_linesearch
+            # c) Solve
+            tStartSolve = time()
+            if verbose >= 3 : print(f" - Solve .......... ", end = "")
+            if solver.lower() != "superlu":
+                Kinv  = residual.mat.Inverse(freedofs=fes.FreeDofs(), inverse = solver)  
+                descent.data = Kinv * res
+            else:
+                rows,cols,vals = residual.mat.COO()
+                Ksp =  sp.csc_matrix((vals,(rows,cols)))
+                Ksp = Ksp[fes.FreeDofs(),:][:,fes.FreeDofs()]
+                Kinv = sp.linalg.splu(Ksp)
+                spsol = Kinv.solve(res.FV().NumPy()[fes.FreeDofs()])
+                descent.data.FV().NumPy()[fes.FreeDofs()] = spsol
+            if verbose >= 3 : print(f"done ({(time()-tStartSolve) * 1000 :.2f} ms).")
+
+
+            # d) Calculation of Newton's decrement
+            decrement = np.sqrt(abs(ngs.InnerProduct(res, descent)))
+            decrement_list.append(decrement)
+
+            if verbose >= 2 : print(f" - Conv : ||residual|| = {residual_list[-1]:.4e} | decr = {decrement_list[-1] :.4e}")
+
+            # e) Line search
+            if linesearch:
+                tStartLineSearch = time()
+                if verbose >= 2 : print(f" - Line search .... ")
+                step_linesearch = 1.0
+                counter_linesearch = 0
                 state_linesearch.data = state.vec - step_linesearch * descent
                 if taskmanager:
                     with ngs.TaskManager():
                         residual.Apply(state_linesearch, res_linesearch)
                 else:
                     residual.Apply(state_linesearch, res_linesearch)
+                res2_state = res2(res)
                 res2_linesearch = res2(res_linesearch)
                 if verbose >= 2 : print(f"   it {counter_linesearch} : ||residual|| = {np.sqrt(res2_linesearch) :.4e} | step = {step_linesearch :.2e}")
 
-                if counter_linesearch >= maxit_linesearch:
-                    if verbose >= 1 : print(f"❌ FAILURE: maximal number of line search iterations reached !!")
-                    status = 3
-                    break
+                while not (res2_linesearch < (1 - 2 * armijo_factor_linesearch * step_linesearch) * res2_state):
+                    counter_linesearch += 1
+                    step_linesearch *= step_factor_linesearch
+                    state_linesearch.data = state.vec - step_linesearch * descent
+                    if taskmanager:
+                        with ngs.TaskManager():
+                            residual.Apply(state_linesearch, res_linesearch)
+                    else:
+                        residual.Apply(state_linesearch, res_linesearch)
+                    res2_linesearch = res2(res_linesearch)
+                    if verbose >= 2 : print(f"   it {counter_linesearch} : ||residual|| = {np.sqrt(res2_linesearch) :.4e} | step = {step_linesearch :.2e}")
 
-                if step_linesearch < minstep_linesearch:
-                    if verbose >= 1 : print(f"❌ FAILURE: minimal line search step reached !!")
-                    status = 2
-                    break
+                    if counter_linesearch >= maxit_linesearch:
+                        if verbose >= 1 : print(f"❌ FAILURE: maximal number of line search iterations reached !!")
+                        status = 3
+                        break
+
+                    if step_linesearch < minstep_linesearch:
+                        if verbose >= 1 : print(f"❌ FAILURE: minimal line search step reached !!")
+                        status = 2
+                        break
+                
+                if verbose >= 3 : print(f" - Line search done ({(time()-tStartLineSearch) * 1000 :.2f} ms).")
             
-            if verbose >= 3 : print(f" - Line search done ({(time()-tStartLineSearch) * 1000 :.2f} ms).")
-        
-        if verbose >= 3 : print(f"     ---------------- End loop ----------------")
-        # f) Update and residual computation
-        if not status: 
-            state.vec.data = state_linesearch
-            res.data = res_linesearch
-            residual_list.append(np.sqrt(res2(res)))
-        else:
-            state.vec.data = state.vec - step_linesearch * descent
-            if taskmanager:
-                with ngs.TaskManager(): residual.Apply(state.vec, res)
-            else: residual.Apply(state.vec, res)
-            residual_list.append(np.sqrt(res2(res)))
+            if verbose >= 3 : print(f"     ---------------- End loop ----------------")
+            # f) Update and residual computation
+            if not status: 
+                state.vec.data = state_linesearch
+                res.data = res_linesearch
+                residual_list.append(np.sqrt(res2(res)))
+            else:
+                state.vec.data = state.vec - step_linesearch * descent
+                if taskmanager:
+                    with ngs.TaskManager(): residual.Apply(state.vec, res)
+                else: residual.Apply(state.vec, res)
+                residual_list.append(np.sqrt(res2(res)))
 
-        # g) Stopping criteria
-        if residual_list[-1] / residual_list[-2] < rtol_residual:
-            if verbose >= 2 : print(f"Stop because linear problem detected.")
-            linear = True
-            break
-        
-        if decrement_list[-1] < atol_decrement : 
-            if verbose >= 2 : print(f"Stop because decrement is lower than tol_decrement.")
-            break
+            # g) Stopping criteria
+            if residual_list[-1] / residual_list[-2] < rtol_residual:
+                if verbose >= 2 : print(f"Stop because linear problem detected.")
+                linear = True
+                break
+            
+            if decrement_list[-1] < atol_decrement : 
+                if verbose >= 2 : print(f"Stop because decrement is lower than tol_decrement.")
+                break
 
-        if residual_list[-1] < atol_residual : 
-            if verbose >= 2 : print(f"Stop because residual is lower than tol_residual.")
-            break
+            if residual_list[-1] < atol_residual : 
+                if verbose >= 2 : print(f"Stop because residual is lower than tol_residual.")
+                break
 
-        if residual_list[-1] / residual_list[0] < rtol_residual:
-            if verbose >= 2 : print(f"Stop because relative residual is lower than rtol_residual.")
-            break
+            if residual_list[-1] / residual_list[0] < rtol_residual:
+                if verbose >= 2 : print(f"Stop because relative residual is lower than rtol_residual.")
+                break
 
-        if counter_newton >= maxit_newton: 
-            if verbose >= 1 : print(f"❌ FAILURE: maximum number of Newton iterations reached !!")
-            status = 1
-            break
+            if counter_newton >= maxit_newton: 
+                if verbose >= 1 : print(f"❌ FAILURE: maximum number of Newton iterations reached !!")
+                status = 1
+                break
 
     # 3) Export results
     if verbose >=2 and not status : 
@@ -1341,14 +1374,11 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
     result["info"]["status"] = status
     result["info"]["linear_detected"] = linear
     result["info"]["iteration"] = counter_newton
-    result["info"]["Kinv"] = Kinv
-    result["info"]["K"] = residual.mat
-    result["info"]["status"] = status
-    result["linear_detected"] = linear
-    result["iteration"] = counter_newton
-    result["residual"] = residual_list
-    result["decrement"] = decrement_list
-    result["info"]["wall_time"] = { "fes": None, 
+    if counter_newton>0: result["info"]["K"] = residual.mat # no Kinv provided
+    result["info"]["Kinv"] = Kinv  
+    result["info"]["residual"] = residual_list
+    result["info"]["decrement"] = decrement_list
+    result["info"]["walltime"] = { "fes": None, 
                                     "assembly": None, 
                                     "decomposition": None, 
                                     "rhs": None, 
@@ -1359,17 +1389,17 @@ def newton(residual : ngs.BilinearForm,                   # residual (written us
     return gfu2state(state, result)
 
 
-
 def operator_magnetostatic(state : dict,
                            type : str,
-                           t : float = 0,
                            bonus_intorder : int = 3,
                            # Slot model - mixed boundary conditions
                            # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
                            #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
-                           robin_bnd   : str = None, # Boundary name where apply mixed condition
-                           robin_coeff :  callable = lambda t: 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                           robin_bnd   : str = None,     # Boundary name where apply mixed condition
+                           robin_coeff :  ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
                            )-> ngs.comp.SumOfIntegrals:
+
+    """ Operator of symmetric magnetostatic formulation """
 
     reluctivity = state["info"]["reluctivity"]
     a_ = state["test"]["a"]
@@ -1380,53 +1410,41 @@ def operator_magnetostatic(state : dict,
 
         #Optional Robin term
     if robin_bnd is not None:
-        alpha = robin_coeff(t)
-        K += a_ * alpha / (1-alpha) * a * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
+        K += robin_coeff / (1-robin_coeff) * a * a_* ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
 
     return K.Compile()
 
 def rhs_magnetostatic(state : dict,
                       t : float = 0,
-                      js_flag = False,              # flag to consider supply as constant 
                       bonus_intorder : int = 3,
                       # Slot model - mixed boundary conditions
                       # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
                       #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
                       robin_bnd   : str = None, # Boundary name where apply mixed condition
-                      robin_coeff :  callable = lambda t: 0,  # Robin coefficient in [0 = neumann, 1 = dirichlet)
-                      a_dirichlet :  callable = lambda t: 0,   # non-zero Dirichlet, in fes
-                      h_tangential :  callable = lambda t: 0,  # Neumann trace
+                      robin_coeff :  ngs.GridFunction | ngs.CoefficientFunction | float = 0,   # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                      a_dirichlet :  ngs.GridFunction | ngs.CoefficientFunction | float = 0,   # non-zero Dirichlet, in fes
+                      h_tangential : ngs.GridFunction | ngs.CoefficientFunction | float = 0,   # Neumann trace
                       )-> ngs.comp.SumOfIntegrals:
 
-    """ Right-hand side of asymmetric magnetoquasistatic formulation """
+    """ Right-hand side of symmetric magnetostatic formulation """
 
-    mesh = state["info"]["fes"].mesh
-    
     magnetization = state["info"]["magnetization"]
-    supply = state["info"]["supply"]
-    bundles = supply.keys()
-
-    J = {bundle: supply[bundle](t) / surface(bundle, mesh)
-        for bundle in bundles}
-    
+    conductivity = state["info"]["conductivity"]
+    I = state["info"]["supply"]
+    bundles = I.keys()
     a_ = state["test"]["a"]
 
     F = 0
 
-    # Eddy-current + constraint coupling in each bundle
-    if js_flag:
-        for bundle in bundles:
-            F += J[bundle] * a_ * ngs.dx(bundle)
-
-    else:
-        for bundle in bundles:
-            F += J[bundle] * a_ * ngs.dx(bundle)
+    # "Static" source current
+    for bundle in bundles:
+        int_conductivity = integrate(conductivity+1e-300, state, bundle)
+        F += I[bundle](t) / int_conductivity * conductivity  * a_ * ngs.dx(bundle, bonus_intorder = bonus_intorder)
 
     # Optional Robin term
     if robin_bnd is not None:
-        alpha = robin_coeff(t)
-        lf += alpha / (1-alpha) * a_dirichlet(t) * a_ * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
-        lf += h_tangential(t) * a_ * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
+        lf += robin_coeff / (1-robin_coeff) * a_dirichlet * a_ * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
+        lf += h_tangential * a_ * ngs.ds(robin_bnd, bonus_intorder = bonus_intorder)
 
     F.Compile()
 
@@ -1435,39 +1453,232 @@ def rhs_magnetostatic(state : dict,
     return F # F.Compile() might not work here because of derivation of real part of complex magnetization
 
 
+def init_magnetoquasistatic_state(fes: ngs.FESpace,  # finite element space
+                                  # Physical parameters
+                                  reluctivity:  callable,  # magnetic reluctivity
+                                  frequency: float,   # electrical frequency
+                                  supply: dict, # supply of electrical conductors, contains complex or callable
+                                  magnetization: callable = 0,  # magnetization (complex or callable)
+                                  conductivity: ngs.GridFunction | ngs.CoefficientFunction | float = 6e7,    # conductivity
+                                  # Robin parameters
+                                  # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                                  #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                                  robin_bnd   : str = None, # Boundary name where apply mixed condition
+                                  robin_coeff : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                                  a_dirichlet : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # non-zero Dirichlet, in fes
+                                  h_tangential   : ngs.GridFunction | ngs.CoefficientFunction | float = 0,  # Neumann trace
+                                  fix1dof : bool = False,   # if true, fix one dof to a_dirichlet value
+                                  # Solver
+                                  solver: str = "pardiso",  # linear solver type
+                                  bonus_intorder : int = 3,       # bonus order of integration in the assembly
+                                  verbose: int = 0,  # for controlling print statements
+                                  taskmanager: bool = True, # for paralelizing assembly process
+                                  # Newton parameters
+                                  maxit_newton : int = 30,              # maximum number of Newton outer iterations
+                                  atol_decrement : float = 1e-8,               # (absolute) tolerance on Newton decrement : sqrt( < residual(uOld), du > )
+                                  atol_residual : float = 1e-8,               # (absolute) tolerance on residual 
+                                  rtol_residual : float = 1e-8,              # relative tolerance on the residual between 2 iterations (to save 1 useless iteration in case of linear problem)
+                                  # Line search parameters
+                                  linesearch : bool = True,             # flag to enable line search (recommended)
+                                  maxit_linesearch : int = 33,          # maximum iteration number within the line search
+                                  minstep_linesearch : float = 1e-10,   # minimum step size allowed in the line search 
+                                  armijo_factor_linesearch : float = 0.1,      # Armijo coefficient in [0, 1) such that |residual(u-step*du)|² < residual²(u) - armijo_factor_linesearch*step*(|residual(u)|²)'(du)
+                                  step_factor_linesearch : float = 0.5, # step size reduction factor in (0, 1) to reduce the step if too big
+                                  ) -> dict:
+    
+    if verbose>=1: print("------- START INITIALIZATION MAGNETOQUASISTATICS -------")
+
+    t0 = time()
+    jw = 2j * np.pi * frequency
+    function = type(lambda t: None)
+
+    if verbose>=1: print("Set up material parameters... ", end ="")
+    # Transform scalars into callable if needed
+    reluctivity_ = copy(reluctivity)
+    if type(reluctivity) != function : # linear reluctivity
+        reluctivity_callable = lambda b : reluctivity_
+    else: reluctivity_callable = reluctivity_
+
+    magnetization_ = copy(magnetization)
+    if type(magnetization) != function:
+        magnetization_callable = lambda t : (magnetization_ * ngs.exp(jw * t)).real
+    else: magnetization_callable = magnetization_
+
+    supply_callable = {}
+    bundles = supply.keys()
+    for bundle in bundles:
+        if type(supply[bundle]) != function:
+            supply_callable[bundle] = lambda t, I=supply[bundle] : (I * ngs.exp(jw * t)).real
+    t1 = time()
+    if verbose>=1: print(f"done ({1000*(t1 - t0):.0f} ms)")
+
+
+    # Initialize the state structure
+    if verbose>=1: print("Set up state structure... ", end ="")
+    trials = fes.TrialFunction()
+    tests = fes.TestFunction()
+    if type(trials) is list:
+        a, a_ = trials[0], tests[0]
+    else:
+        a, a_ = trials, tests
+
+    if fix1dof:
+        dummy = ngs.GridFunction(fes)
+        dummy.Set(1)
+        ind = np.nonzero(dummy.vec.FV().NumPy())[0][0]
+        fes.FreeDofs()[ind] = False
+
+
+    init_state = {
+                    "solution": {"a": ngs.GridFunction(fes), "E" : None},
+                    "trial": {"a": a, "E": None},
+                    "test": {"a": a_, "E": None},
+                    "bundles": bundles,
+                    # plan : add "solver", "problem" subcategories
+                    "info": {
+                        "fes": fes,
+                        "reluctivity" : reluctivity_callable,
+                        "magnetization" : magnetization_callable,
+                        "frequency" : frequency,
+                        "supply" : supply_callable,
+                        "conductivity" : conductivity,
+                        "Kinv": None,
+                        "K" : None,
+                        "F" : None,
+                        "solver": solver,
+                        "bonus_intorder" : bonus_intorder,
+                        "verbose" : verbose, 
+                        "taskmanager" : taskmanager,
+                        "maxit_newton" : maxit_newton,
+                        "atol_decrement" : atol_decrement,
+                        "atol_residual" : atol_residual,
+                        "rtol_residual" : rtol_residual,
+                        "linesearch": linesearch,
+                        "maxit_linesearch" : maxit_linesearch,
+                        "minstep_linesearch": minstep_linesearch,
+                        "armijo_factor_linesearch" : armijo_factor_linesearch,
+                        "step_factor_linesearch" : step_factor_linesearch,
+                        "robin_bnd" : robin_bnd, 
+                        "robin_coeff" :robin_coeff, 
+                        "a_dirichlet" : a_dirichlet,
+                        "h_tangential" : h_tangential,
+                        "fix1dof" : fix1dof,
+                        "walltime" : {"fes": None, 
+                                    "assembly": None, 
+                                    "decomposition": None, 
+                                    "rhs": None, 
+                                    "solve": None,
+                                    "total":None}
+                        },
+                    }
+    
+    t2 = time()
+    if verbose>=1: print(f"done ({1000*(t2 - t1):.0f} ms)")
+
+    if verbose>=1: print("Solve initial magnetostatic problem... ", end ="")
+
+    residual = ngs.BilinearForm(fes, symmetric = True)
+    residual = operator_magnetostatic(init_state, type="trial",
+                                      robin_bnd = robin_bnd,
+                                      robin_coeff=robin_coeff,
+                                      bonus_intorder=init_state["info"]["bonus_intorder"]) \
+                - rhs_magnetostatic(init_state, t = 0,
+                                    robin_bnd=robin_bnd,
+                                    robin_coeff= robin_coeff,
+                                    a_dirichlet=a_dirichlet,
+                                    h_tangential=h_tangential,
+                                    bonus_intorder=init_state["info"]["bonus_intorder"])
+    
+    
+    init_state = newton(residual = residual,
+                        initial_state  = init_state,
+                        verbose = verbose,
+                        maxit_newton  = maxit_newton,
+                        atol_decrement = atol_decrement,   
+                        atol_residual = atol_residual,      
+                        rtol_residual = rtol_residual,   
+                        linesearch = linesearch,
+                        maxit_linesearch = maxit_linesearch,       
+                        minstep_linesearch = minstep_linesearch,
+                        armijo_factor_linesearch = armijo_factor_linesearch,     
+                        step_factor_linesearch = step_factor_linesearch,
+                        taskmanager = taskmanager,         
+                        solver = solver 
+                        ) 
+    t3 = time()
+    if verbose>=1: print(f"done ({1000*(t3 - t2):.0f} ms)")
+
+
+    if verbose>=1: print("Adapt space for magnetoquasistatics... ", end ="")
+
+    # Extend FE space with Lagrange multipliers (bundle constraints)
+    for _ in bundles:
+        fes *= ngs.NumberSpace(fes.mesh)
+
+    trials = fes.TrialFunction()
+    tests = fes.TestFunction()
+
+    if type(trials) is list:
+        a, a_ = trials[0], tests[0]
+    else:
+        a, a_ = trials, tests
+    
+        
+    solution = ngs.GridFunction(fes)
+    aSol = solution.components[0]
+    aSol.vec.data = init_state["solution"]["a"].vec
+
+    E = {bundle: trials[i + 1] for i, bundle in enumerate(bundles)}
+    E_ = {bundle: tests[i + 1] for i, bundle in enumerate(bundles)}   
+    eSol = {bundle: solution.components[i + 1] for i, bundle in enumerate(bundles)}
+
+    init_state["info"]["fes"] = fes
+    init_state["solution"]["a"] = aSol
+    init_state["solution"]["E"] = eSol
+    init_state["trial"]["a"] = a
+    init_state["trial"]["E"] = E
+    init_state["test"]["a"] = a_
+    init_state["test"]["E"] = E_
+
+    init_state["time"] = 0
+
+    t4 = time()
+    if verbose>=1: print(f"done ({1000*(t4 - t3):.0f} ms)")
+    if verbose>=1: print("-------- END INITIALIZATION MAGNETOQUASISTATICS ---------")
+
+    return init_state
+
+    
+
 def operator_magnetoquasistatic_time_domain(state : dict,
-                                            t : float,
                                             dt : float,
-                                            type : str,
                                             theta : float = 0.5,
-                                            bonus_intorder : int = 3,
                                             # Slot model - mixed boundary conditions
                                             # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
                                             #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
                                             robin_bnd   : str = None, # Boundary name where apply mixed condition
-                                            robin_coeff : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                                            robin_coeff_New : ngs.GridFunction | ngs.CoefficientFunction | float = 0,     # Robin coefficient in [0 = neumann, 1 = dirichlet)
                                             )-> ngs.comp.SumOfIntegrals:
-    """ Operator of asymmetric magnetoquasistatic formulation """
+    """ Operator of symmetric magnetoquasistatic formulation """
 
-    conductivity = state["info"]["conductivity"]
-    e_ = state["test"]["e"]
-    a_ = state["test"]["a"]
-    eNew = state[type]["e"]
-    aNew = state[type]["a"]
-
+    bonus_intorder = state["info"]["bonus_intorder"]
     K = 0
     # Magnetostatic part
     if theta >0:
-        K += theta * operator_magnetostatic(state = state, type = type,
-                                            t = t + dt,
+        K += theta * operator_magnetostatic(state = state,
+                                            type = "trial",
                                             bonus_intorder = bonus_intorder,
                                             robin_bnd = robin_bnd,
-                                            robin_coeff = robin_coeff)
+                                            robin_coeff = robin_coeff_New)
 
-    # Eddy-current + constraint coupling in each bundle
+    # Eddy-current coupling in each bundle
+    conductivity = state["info"]["conductivity"]
+    E_ = state["test"]["E"]
+    a_ = state["test"]["a"]
+    ENew = state["trial"]["E"]
+    aNew = state["trial"]["a"]
     for bundle in state["info"]["supply"].keys():
-        K += conductivity * ( aNew/dt  + theta * eNew[bundle]) * (a_ + e_[bundle]) * ngs.dx(bundle, 
-                                                                                            bonus_intorder = bonus_intorder)
+        K += conductivity/dt * ( aNew  + theta * ENew[bundle]) * (a_ + E_[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
 
     return K.Compile() 
 
@@ -1481,55 +1692,242 @@ def rhs_magnetoquasistatic_time_domain(state : dict,
                                        # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
                                        #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
                                        robin_bnd   : str = None, # Boundary name where apply mixed condition
-                                       robin_coeff : callable = lambda t: 0,     # robin_coeff(t) -> GridFunction or CoefficientFunction [0 = neumann, 1 = dirichlet); 
-                                       a_dirichlet : callable = lambda t: 0,     # a_dirichlet(t) -> GridFunction or CoefficientFunction (non-zero Dirichlet, in fes)
-                                       h_tangential : callable = lambda t: 0,    # h_tangential(t)->  GridFunction or CoefficientFunction (Neumann trace)
+                                       robin_coeff_Old : ngs.GridFunction | ngs.CoefficientFunction | float = None,    # at t [0 = neumann, 1 = dirichlet); 
+                                       robin_coeff_New : ngs.GridFunction | ngs.CoefficientFunction | float = None,    # t+dt
+                                       a_dirichlet_Old : ngs.GridFunction | ngs.CoefficientFunction | float = None,    # t 
+                                       a_dirichlet_New : ngs.GridFunction | ngs.CoefficientFunction | float = None,    # t+dt
+                                       h_tangential_Old : ngs.GridFunction | ngs.CoefficientFunction | float = None,   # t
+                                       h_tangential_New : ngs.GridFunction | ngs.CoefficientFunction | float = None,   # t+dt
                                        )-> ngs.comp.SumOfIntegrals:
 
-    """ Right-hand side of asymmetric magnetoquasistatic formulation """
+    """ Right-hand side of symmetric magnetoquasistatic formulation """
 
     conductivity = state["info"]["conductivity"]
-    supply = state["info"]["supply"]
-    bundles = supply.keys()
+    I = state["info"]["supply"]
+    bundles = I.keys()
+    bonus_intorder = state["info"]["bonus_intorder"]
 
-    J = {bundle: lambda t: supply[bundle](t) / surface(bundle,  state["info"]["fes"].mesh)
-        for bundle in bundles}
-    
-    e_ = state["test"]["e"]
+    E_ = state["test"]["E"]
     a_ = state["test"]["a"]
-    eOld = state["solution"]["e"]
+    eOld = state["solution"]["E"]
     aOld = state["solution"]["a"]
 
     # Eddy-current coupling in each bundle
     F = 0
     for bundle in bundles:
-        F += conductivity * ( aOld/dt  - (1-theta) * eOld[bundle]) * (a_ + e_[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
+        F += conductivity/dt * ( aOld + eOld[bundle]) * (a_ + E_[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
 
     # Magnetostatic part
     F += -(1-theta) * operator_magnetostatic(state = state, 
                                             type = "solution",
-                                            t = t,
                                             bonus_intorder = bonus_intorder,
                                             robin_bnd = robin_bnd,
-                                            robin_coeff = robin_coeff)
+                                            robin_coeff = robin_coeff_Old)
         
     F.Compile()
 
-    F += (1-theta) * rhs_magnetostatic(state = state, t = t,
-                                      bonus_intorder = bonus_intorder,  
-                                      robin_bnd  = robin_bnd, 
-                                      robin_coeff  = robin_coeff,
-                                      a_dirichlet = a_dirichlet,
-                                      h_tangential = h_tangential)
+    if robin_bnd is not None:
+        if robin_coeff_Old is None: robin_coeff_Old = robin_coeff_New
+        if robin_coeff_New is None: robin_coeff_New = robin_coeff_Old
+        if a_dirichlet_Old is None: a_dirichlet_Old = a_dirichlet_New
+        if a_dirichlet_New is None: a_dirichlet_New = a_dirichlet_Old
+        if h_tangential_Old is None: h_tangential_Old = h_tangential_New
+        if h_tangential_New is None: h_tangential_New = h_tangential_Old
+
+    F += (1-theta) * rhs_magnetostatic(state, t = t,
+                                       robin_bnd=robin_bnd,
+                                       robin_coeff= robin_coeff_Old,
+                                       a_dirichlet=a_dirichlet_Old,
+                                       h_tangential=h_tangential_Old,
+                                       bonus_intorder=bonus_intorder)
 
     F += theta * rhs_magnetostatic(state = state, t = t + dt,
                                    bonus_intorder = bonus_intorder,
                                    robin_bnd  = robin_bnd, 
-                                   robin_coeff  = robin_coeff,
-                                   a_dirichlet = a_dirichlet,
-                                   h_tangential = h_tangential)
+                                   robin_coeff  = robin_coeff_New,
+                                   a_dirichlet = a_dirichlet_New,
+                                   h_tangential = h_tangential_New)
 
     return F
+
+
+def  solve_magnetoquasistatic_time_domain(fes: ngs.FESpace,  # finite element space
+                                          # Physical parameters
+                                          time_list : list,   # list of the time steps
+                                          supply: dict, # supply of electrical conductors, contains complex or callable
+                                          reluctivity:  callable = 1/(4e-7*ngs.pi),  # magnetic reluctivity
+                                          frequency: float = 50,   # electrical frequency (if supply is complex and not callable)
+                                          magnetization: callable = 0,  # magnetization (complex or callable)
+                                          conductivity: ngs.GridFunction | ngs.CoefficientFunction | float = 6e7,    # conductivity
+                                          # Robin parameters
+                                          # on selected boundary, apply : robin_coeff*a           + (1-robin_coeff)*nu*da/dn
+                                          #                             = robin_coeff*a_dirichlet + (1-robin_coeff)*Trace(h_neumann)
+                                          robin_bnd   : str = None, # Boundary name where apply mixed condition
+                                          robin_coeff : list = [0],     # Robin coefficient in [0 = neumann, 1 = dirichlet)
+                                          a_dirichlet : list = [0],     # non-zero Dirichlet, in fes
+                                          h_tangential   : list = [0],  # Neumann trace
+                                          fix1dof : bool = False,   # if true, fix one dof to a_dirichlet value
+                                          # low-level solver
+                                          theta : float = 0.5,          # time integrator coefficient (0 = explicit euler, 1 = implicit euler)
+                                          solver: str = "pardiso",      # linear solver type
+                                          bonus_intorder : int = 3,       # bonus order of integration in the assembly
+                                          verbose: int = 0,  # for controlling print statements
+                                          taskmanager: bool = True, # for paralelizing assembly process
+                                          # Newton parameters
+                                          maxit_newton : int = 30,              # maximum number of Newton outer iterations
+                                          atol_decrement : float = 1e-8,               # (absolute) tolerance on Newton decrement : sqrt( < residual(uOld), du > )
+                                          atol_residual : float = 1e-8,               # (absolute) tolerance on residual 
+                                          rtol_residual : float = 1e-8,              # relative tolerance on the residual between 2 iterations (to save 1 useless iteration in case of linear problem)
+                                          # Line search parameters
+                                          linesearch : bool = True,             # flag to enable line search (recommended)
+                                          maxit_linesearch : int = 33,          # maximum iteration number within the line search
+                                          minstep_linesearch : float = 1e-10,   # minimum step size allowed in the line search 
+                                          armijo_factor_linesearch : float = 0.1,      # Armijo coefficient in [0, 1) such that |residual(u-step*du)|² < residual²(u) - armijo_factor_linesearch*step*(|residual(u)|²)'(du)
+                                          step_factor_linesearch : float = 0.5, # step size reduction factor in (0, 1) to reduce the step if too big
+                                          draw = False, # inspect
+                                          ) -> dict:
+
+    """ Solve symmetric magnetoquasistatic problem in time domain from initial situation """
+
+    init_state = init_magnetoquasistatic_state(fes = fes,
+                                               reluctivity = reluctivity, 
+                                               frequency = frequency,
+                                               supply = supply,
+                                               magnetization = magnetization,
+                                               conductivity = conductivity,
+                                               robin_bnd = robin_bnd,
+                                               robin_coeff = robin_coeff,
+                                               a_dirichlet = a_dirichlet,
+                                               h_tangential = h_tangential, 
+                                               fix1dof = fix1dof,
+                                               solver = solver,
+                                               bonus_intorder = bonus_intorder,
+                                               verbose = verbose,
+                                               taskmanager = taskmanager,
+                                               maxit_newton = maxit_newton,
+                                               atol_decrement = atol_decrement,
+                                               atol_residual = atol_residual,
+                                               rtol_residual = rtol_residual,
+                                               linesearch = linesearch,
+                                               maxit_linesearch = maxit_linesearch, 
+                                               minstep_linesearch = minstep_linesearch,
+                                               armijo_factor_linesearch = armijo_factor_linesearch,
+                                               step_factor_linesearch = step_factor_linesearch)
+
+    state_list = [copy_state(init_state)]
+    if draw:
+        scene = ngs.webgui.Draw(state_list[-1]["solution"]["a"], init_state["info"]["fes"].mesh)
+
+    if type(robin_coeff) != list: robin_coeff = [robin_coeff] * len(time_list)
+    if len(robin_coeff) == 1: robin_coeff = robin_coeff * len(time_list)
+    if type(a_dirichlet) != list: a_dirichlet = [a_dirichlet] * len(time_list)
+    if len(a_dirichlet) == 1: a_dirichlet = a_dirichlet * len(time_list)
+    if type(h_tangential) != list: h_tangential = [h_tangential] * len(time_list)
+    if len(h_tangential) == 1: h_tangential = h_tangential * len(time_list)
+
+    if theta == 0: # purely explicit scheme (does not work because conductivity is not defined everywhere)
+        expr = operator_magnetoquasistatic_time_domain(state = init_state,
+                                                       dt = 1,
+                                                       theta = theta,
+                                                       robin_bnd = robin_bnd,
+                                                       robin_coeff_New = robin_coeff[0]
+                                                       ) 
+        if taskmanager:
+            with ngs.TaskManager():
+                K = ngs.BilinearForm(expr, symmetric = True).Assemble().mat
+        else:
+            K = ngs.BilinearForm(expr, symmetric = True).Assemble().mat
+
+        Kinv = K.Inverse(freedofs = fes.FreeDofs(), inverse = solver)
+
+    
+    for i in range(len(time_list)-1):
+        t = time_list[i]
+        dt = time_list[i+1]-time_list[i]
+        if verbose>=1 : print(f"{t = : .2e} s ({(i+1)/len(time_list) * 100 :.1f} %) ... ", end = "")
+
+        if theta  >0:
+            residual = operator_magnetoquasistatic_time_domain(state = copy_state(state_list[-1]),
+                                                            dt = dt,
+                                                            theta = theta,
+                                                            robin_bnd = robin_bnd,
+                                                            robin_coeff_New = robin_coeff[i]
+                                                            ) \
+                    - rhs_magnetoquasistatic_time_domain(copy_state(state_list[-1]), t, dt, 
+                                                        theta = theta,
+                                                        bonus_intorder = bonus_intorder,
+                                                        robin_bnd  = robin_bnd,
+                                                        robin_coeff_Old = robin_coeff[i],
+                                                        robin_coeff_New = robin_coeff[i+1],
+                                                        a_dirichlet_Old = a_dirichlet[i],    # t 
+                                                        a_dirichlet_New = a_dirichlet[i+1],
+                                                        h_tangential_Old  = h_tangential[i],
+                                                        h_tangential_New  = h_tangential[i+1])
+            
+            state_list.append(newton(residual  = ngs.BilinearForm(residual, symmetric = True),
+                                     initial_state = state_list[-1].copy(),
+                                     verbose = verbose,
+                                     maxit_newton = maxit_newton,
+                                     atol_decrement = atol_decrement, 
+                                     atol_residual = atol_residual, 
+                                     rtol_residual = rtol_residual, 
+                                     linesearch = linesearch, 
+                                     maxit_linesearch = maxit_linesearch, 
+                                     minstep_linesearch = minstep_linesearch, 
+                                     armijo_factor_linesearch = armijo_factor_linesearch, 
+                                     step_factor_linesearch = step_factor_linesearch,
+                                     taskmanager =  taskmanager, 
+                                     solver = solver)
+                                     )
+        
+        else:
+            residual = - rhs_magnetoquasistatic_time_domain(copy_state(state_list[-1]), t, dt, 
+                                                            theta = 0,
+                                                            bonus_intorder = bonus_intorder,
+                                                            robin_bnd  = robin_bnd,
+                                                            robin_coeff_Old = robin_coeff[i],
+                                                            robin_coeff_New = robin_coeff[i+1],
+                                                            a_dirichlet_Old = a_dirichlet[i],    # t 
+                                                            a_dirichlet_New = a_dirichlet[i+1],
+                                                            h_tangential_Old  = h_tangential[i],
+                                                            h_tangential_New  = h_tangential[i+1])
+            
+
+            state_list.append(newton(residual  = ngs.BilinearForm(residual, symmetric = True),
+                                    initial_state = copy_state(state_list[-1]),
+                                    verbose = verbose,
+                                    maxit_newton = maxit_newton,
+                                    atol_decrement = atol_decrement, 
+                                    atol_residual = atol_residual, 
+                                    rtol_residual = rtol_residual, 
+                                    linesearch = linesearch, 
+                                    maxit_linesearch = maxit_linesearch, 
+                                    minstep_linesearch = minstep_linesearch, 
+                                    armijo_factor_linesearch = armijo_factor_linesearch, 
+                                    step_factor_linesearch = step_factor_linesearch,
+                                    taskmanager =  taskmanager, 
+                                    solver = solver,
+                                    Kinv = Kinv)
+                                    )
+            state_scaled = state2gfu(state_list[-1])
+            state_scaled.vec.data = state_scaled.vec.data * dt
+            state_list[-1] = gfu2state(state_scaled, state_list[-1])
+            
+        if draw:
+            scene.Redraw(state_list[-1]["solution"]["a"], init_state["info"]["fes"].mesh)
+        
+        state_list[-1]["time"] = t + dt
+
+        if verbose>=1 : 
+            status = state_list[-1]["info"]["status"]
+            if status : print(f"Newton failed (error code: {status})")
+            elif state_list[-1]["info"]["iteration"] == 1:
+                print(f"Newton succeeded (1 iteration, {state_list[-1]["info"]["walltime"]["total"]:.2} s)")
+            else:
+                print(f"Newton succeeded ({state_list[-1]["info"]["iteration"]} iterations, {state_list[-1]["info"]["walltime"]["total"]:.2} s)")
+
+    return state_list
+
 
 
 #%% Post-processing
@@ -1617,7 +2015,7 @@ def electric_field(results: dict,              # result of solve_magnetoharmonic
     Notes
     -----
     - The electric field is computed as:
-        E = -jω (A - e_bundle)
+        E = -jω (A - E_bundle)
     - A conductivity mask is applied to restrict the field to conductors
       and avoid division by zero.
     """
@@ -1669,7 +2067,7 @@ def electric_field_eddy_current(results: dict,              # result of solve_ma
     Notes
     -----
     - The eddy current electric field is computed as:
-        E = -jω (A - e_bundle)
+        E = -jω (A - E_bundle)
     - A conductivity mask is applied to restrict the field to conductors
       and avoid division by zero.
     """
@@ -1873,16 +2271,28 @@ def joule_losses2(results : dict,
     E =  electric_field_eddy_current(results = results)
     E.Compile()
 
-    Pdc = 0
-    Pac = 0
+    Pbf = 0 # losses due to source current
+    Phf = 0 # losses due to eddy current
+
+    # both can be sumed because eddy current are zero in average so that
+    # 2p = <(J_bf + J_hf), (J_bf + J_hf)> / σ =|Jbf|² / σ + |Jhf|² / σ + (<(J_bf ,J_hf)> + <(J_bf ,J_hf)>) / σ
+    # but (<(J_bf ,J_hf)> + <(J_bf ,J_hf)>) / σ = 2 Re(I σ / int(sigma) conj(J_hf)) / σ 
+    #                                           = 2 Re(I / int(sigma) conj(J_hf))         since  σ ∈ R
+    # so the spatial average of this term over the bundle reads
+    # = avg( 2 Re(I / int(sigma) conj(J_hf)) )
+    # =  2 Re( avg(E conj(J_hf)) )  by linearity, with E = I / int(sigma) 
+    # =  2 Re(E avg( conj(J_hf)) )  since E =  is a constant over the bundle
+    # =  0 because avg( conj(J_hf)) ) = conj( avg( J_hf ) ) = 0 over the bundle
+    # therefore, only Pbf = int(|Jbf|² / 2σ) and  |Jhf|² = int(|Jhf|² / 2σ) have to be computed
+
     I = results["info"]["supply"]
     for bundle in results["bundles"]:
         if match(zone, bundle):
             intSigma = integrate(sigma, results, bundle)
-            Pac += integrate(ngs.InnerProduct(E,E).real * sigma, results, bundle) / 2
-            Pdc += abs(I[bundle])**2 / intSigma / 2
+            Pbf += integrate(ngs.InnerProduct(E,E).real * sigma, results, bundle) / 2
+            Phf += abs(I[bundle])**2 / intSigma / 2
 
-    return Pac + Pdc
+    return Pbf + Phf
 
 def matrix_arkkio() -> ngs.CoefficientFunction :
     """

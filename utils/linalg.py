@@ -33,29 +33,27 @@ __status__ = "Development"
 
 from scipy.sparse import csc_matrix
 import ngsolve as ngs
+from utils.physics_symmetric import integrate
 
 #%% Vector and matrices
 
 def L2norm(field,
-           mesh,
-           zone : str = None):
+           state,
+           zone : str = ".*"):
     """ Compute L2 norm """
-    if zone is None:
-        return ngs.sqrt(ngs.Integrate(ngs.Norm(field)**2, mesh))
-    else:
-        return ngs.sqrt(ngs.Integrate(ngs.Norm(field)**2, mesh.Materials(zone)))
+    return ngs.sqrt(integrate(ngs.Norm(field)**2, state, zone))
 
 
 def H1norm(field,
-           mesh,
+           state,
            gradfield : callable = None,
-           zone : str = None):
+           zone : str = ".*"):
     """ Compute H1 norm """
     if gradfield is None:
         expr = ngs.Norm(field)**2 + ngs.Norm(ngs.grad(field))**2
     else:
         expr = ngs.Norm(field)**2 + ngs.Norm(gradfield)**2
-    return ngs.sqrt(ngs.Integrate(expr, mesh))
+    return ngs.sqrt(ngs.integrate(expr, state, zone))
     
 def sparse(bf, freedofs_rows = None, freedofs_cols=None):
     """
