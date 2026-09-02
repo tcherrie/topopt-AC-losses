@@ -2236,7 +2236,9 @@ def joule_losses(results : dict,
     sigma = results["info"]["conductivity"] + 1e-300
 
     # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
-    P = integrate(ngs.InnerProduct(j, j).real / sigma, results, zone) / 2
+    p = ngs.InnerProduct(j, j).real / sigma
+    p.Compile()
+    P = integrate(p, results, zone) / 2
 
     return P
 

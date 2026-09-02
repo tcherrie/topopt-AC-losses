@@ -55,8 +55,6 @@ def H1norm(field,
         expr = ngs.Norm(field)**2 + ngs.Norm(gradfield)**2
     return ngs.sqrt(ngs.integrate(expr, state, zone))
     
-def sparse(bf, freedofs_rows = None, freedofs_cols=None):
-
 def sparse(bf, 
            freedofs_rows = None, 
            freedofs_cols =None,
