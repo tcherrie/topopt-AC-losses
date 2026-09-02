@@ -34,7 +34,30 @@ from utils.physics_symmetric import integrate
 def L2norm(field,
            state,
            zone : str = ".*"):
-    """ Compute L2 norm """
+    """
+    Compute the L2 norm of a field over a specified region.
+
+    Evaluates :math:`\\|f\\|_{L^2} = \\sqrt{\\int_\\Omega |f|^2 \\, dx}`.
+
+    Parameters
+    ----------
+    field : ngs.CoefficientFunction or ngs.GridFunction
+        Field whose L2 norm is to be computed.
+    state : dict
+        Simulation state dictionary (provides mesh and material information).
+    zone : str, optional
+        Regular expression matching material names for the integration zone.
+        Default is ``".*"`` (entire domain).
+
+    Returns
+    -------
+    float
+        The L2 norm of the field over the specified zone.
+
+    See Also
+    --------
+    H1norm : Computes the H1 norm (includes gradient contribution).
+    """
     return ngs.sqrt(integrate(ngs.Norm(field)**2, state, zone))
 
 
@@ -42,7 +65,37 @@ def H1norm(field,
            state,
            gradfield : callable = None,
            zone : str = ".*"):
-    """ Compute H1 norm """
+    """
+    Compute the H1 norm of a field over a specified region.
+
+    Evaluates :math:`\\|f\\|_{H^1} = \\sqrt{\\int_\\Omega (|f|^2 + |\\nabla f|^2) \\, dx}`.
+
+    If a precomputed gradient is provided via ``gradfield``, it is used instead
+    of ``ngs.grad(field)`` (useful when the gradient is available from a
+    previous computation).
+
+    Parameters
+    ----------
+    field : ngs.CoefficientFunction or ngs.GridFunction
+        Field whose H1 norm is to be computed.
+    state : dict
+        Simulation state dictionary (provides mesh and material information).
+    gradfield : callable, optional
+        Precomputed gradient expression for ``field``. If ``None``,
+        :math:`\\nabla f` is computed automatically via ``ngs.grad(field)``.
+    zone : str, optional
+        Regular expression matching material names for the integration zone.
+        Default is ``".*"`` (entire domain).
+
+    Returns
+    -------
+    float
+        The H1 norm of the field over the specified zone.
+
+    See Also
+    --------
+    L2norm : Computes the L2 norm (no gradient contribution).
+    """
     if gradfield is None:
         expr = ngs.Norm(field)**2 + ngs.Norm(ngs.grad(field))**2
     else:
@@ -71,9 +124,10 @@ def sparse(bf,
 
     Returns
     -------
-    scipy.sparse.csc_matrix
+    scipy.sparse.spmatrix
         Sparse matrix constructed from the COO representation of ``bf``,
-        optionally restricted to the specified rows and columns.
+        optionally restricted to the specified rows and columns. The exact
+        type depends on the ``type`` parameter (``csc``, ``csr``, or ``coo``).
     """
     r,c,vals  = bf.COO()
     if type.lower() == "csc":

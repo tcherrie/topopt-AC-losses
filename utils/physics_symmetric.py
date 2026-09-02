@@ -53,8 +53,8 @@ def state2gfu(state : dict) -> ngs.GridFunction:
     it as an NGSolve GridFunction.
 
     The function reconstructs a GridFunction associated with the finite element
-    space stored in ``state["info"]["fes"]`` and copies the magnetic vector
-    potential and, when present, the electric potentials of the conducting
+    space stored in ``state["info"]["problem"]["space"]`` and copies the magnetic
+    vector potential and, when present, the electric potentials of the conducting
     bundles from the solution dictionary.
 
     Parameters
@@ -63,7 +63,7 @@ def state2gfu(state : dict) -> ngs.GridFunction:
         Simulation state dictionary, typically returned by a magneto-harmonic
         solver. It is expected to contain:
 
-        ``state["info"]["fes"]``
+        ``state["info"]["problem"]["space"]``
             The NGSolve finite element space associated with the solution.
 
         ``state["solution"]["a"]``
@@ -81,8 +81,8 @@ def state2gfu(state : dict) -> ngs.GridFunction:
     Returns
     -------
     ngs.GridFunction
-        A GridFunction defined on ``state["info"]["fes"]`` containing the
-        complete solution state. The first component contains the magnetic
+        A GridFunction defined on ``state["info"]["problem"]["space"]`` containing
+        the complete solution state. The first component contains the magnetic
         vector potential, while subsequent components contain the electric
         potentials associated with the conducting bundles.
 
@@ -96,7 +96,7 @@ def state2gfu(state : dict) -> ngs.GridFunction:
     containing only the magnetic vector potential.
     """
 
-    fes = state["info"]["fes"]
+    fes = state["info"]["problem"]["space"]
     sol = ngs.GridFunction(fes)
     try:
         sol.components[0].vec.data = state["solution"]["a"].vec
@@ -151,7 +151,7 @@ def gfu2state(gfu : ngs.GridFunction,
     as the magnetic vector potential under ``state_copy["solution"]["a"]``.
     """
 
-    fes = state["info"]["fes"]
+    fes = state["info"]["problem"]["space"]
     sol = ngs.GridFunction(fes)
     solution = {"a" : None, "E" : {}}
     try:
@@ -250,7 +250,7 @@ def integrate(property: ngs.GridFunction | ngs.CoefficientFunction,
 
     results : dict
         Simulation results dictionary containing at least the FESpace
-        and mesh information under `results["info"]["fes"]`.
+        and mesh information under `results["info"]["problem"]["space"]`.
 
     zone : str, optional
         Material or region selector (regex-style). Default is ".*" (whole domain).
@@ -265,11 +265,19 @@ def integrate(property: ngs.GridFunction | ngs.CoefficientFunction,
     - The integration is performed using NGSolve integration utilities.
     """
 
-    mesh = results["info"]["fes"].mesh
+    # Support both new nested schema and legacy flat schema
+    if "problem" in results.get("info", {}):
+        space = results["info"]["problem"]["space"]
+    elif "fes" in results.get("info", {}):
+        space = results["info"]["fes"]
+    else:
+        raise KeyError("Cannot find 'space' or 'fes' in results['info']")
+
+    mesh = space.mesh
 
     # Compute integral of the field over the region and normalize
-    try: order = max([mesh.GetCurveOrder(), 2*results["info"]["fes"].components[0].globalorder + 1 , order_min])
-    except: order = max([mesh.GetCurveOrder(), 2*results["info"]["fes"].globalorder + 1 , order_min])
+    try: order = max([mesh.GetCurveOrder(), 2*space.components[0].globalorder + 1 , order_min])
+    except: order = max([mesh.GetCurveOrder(), 2*space.globalorder + 1 , order_min])
     
     return ngs.Integrate(property, mesh.Materials(zone), order = order)
 
@@ -291,7 +299,7 @@ def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
 
     results : dict
         Simulation results dictionary containing at least the FESpace
-        and mesh information under `results["info"]["fes"]`.
+        and mesh information under `results["info"]["problem"]["space"]`.
 
     zone : str, optional
         Material or region selector (regex-style). Default is ".*" (whole domain).
@@ -308,7 +316,7 @@ def average_property(property: ngs.GridFunction | ngs.CoefficientFunction,
     - The integration is performed using NGSolve integration utilities.
     """
 
-    mesh = results["info"]["fes"].mesh
+    mesh = results["info"]["problem"]["space"].mesh
     return integrate(property, results, zone, order_min) / surface(zone, mesh)
 
 def magnetization_halbach(br: float = 1,
@@ -669,24 +677,41 @@ def solve_magnetoharmonic(
         "test": {"a": a_, "E": E_},
         "bundles": bundles,
         "info": {
-            "fes": fes,
-            "reluctivity": reluctivity,
-            "magnetization": magnetization,
-            "frequency": frequency,
-            "supply": supply,
-            "conductivity": conductivity,
-            "Kinv": Kinv,
-            "K" : K,
-            "F": -res,
-            "solver": solver,
-            "walltime" : {"fes": t_fes, 
-                          "assembly": t_assembly, 
-                          "decomposition": t_decomposition, 
-                          "rhs": t_rhs, 
-                          "solve": t_solve,
-                          "total":time_total}
+            "problem": {
+                "space": fes,
+                "reluctivity": reluctivity,
+                "magnetization": magnetization,
+                "frequency": frequency,
+                "supply": supply,
+                "conductivity": conductivity,
             },
-        }  
+            "robin": {
+                "robin_coeff": robin_coeff,
+                "a_dirichlet": a_dirichlet,
+                "h_tangential": h_tangential,
+                "fix1dof": fix1dof,
+            },
+            "solver": {
+                "library": solver,
+                "assembly": {
+                    "bonus_intorder": bonus_intorder,
+                    "taskmanager": taskmanager,
+                    "verbose": verbose,
+                },
+                "operators": {
+                    "Kinv": Kinv,
+                    "K": K,
+                    "F": -res,
+                },
+            },
+            "timing": {"fes": t_fes, 
+                       "assembly": t_assembly, 
+                       "decomposition": t_decomposition, 
+                       "rhs": t_rhs, 
+                       "solve": t_solve,
+                       "total": time_total},
+        },
+    }
 
     if verbose >= 1:
         print(f"total time: {time_total:.3f} s")
@@ -1010,24 +1035,41 @@ def solve_magnetoharmonic2(
         "test": {"a": a_, "E": E_},
         "bundles": bundles,
         "info": {
-            "fes": fes,
-            "reluctivity": reluctivity,
-            "magnetization": magnetization,
-            "frequency": frequency,
-            "supply": supply,
-            "conductivity": conductivity,
-            "Kinv": Kinv,
-            "K" : K,
-            "F": -res,
-            "solver": solver,
-            "walltime" : {"fes": t_fes, 
-                          "assembly": t_assembly, 
-                          "decomposition": t_decomposition, 
-                          "rhs": t_rhs, 
-                          "solve": t_solve,
-                          "total":time_total}
+            "problem": {
+                "space": fes,
+                "reluctivity": reluctivity,
+                "magnetization": magnetization,
+                "frequency": frequency,
+                "supply": supply,
+                "conductivity": conductivity,
             },
-        }  
+            "robin": {
+                "robin_coeff": robin_coeff,
+                "a_dirichlet": a_dirichlet,
+                "h_tangential": h_tangential,
+                "fix1dof": fix1dof,
+            },
+            "solver": {
+                "library": solver,
+                "assembly": {
+                    "bonus_intorder": bonus_intorder,
+                    "taskmanager": taskmanager,
+                    "verbose": verbose,
+                },
+                "operators": {
+                    "Kinv": Kinv,
+                    "K": K,
+                    "F": -res,
+                },
+            },
+            "timing": {"fes": t_fes, 
+                       "assembly": t_assembly, 
+                       "decomposition": t_decomposition, 
+                       "rhs": t_rhs, 
+                       "solve": t_solve,
+                       "total": time_total},
+        },
+    }
 
     if verbose >= 1:
         print(f"total time: {time_total:.3f} s")
@@ -1365,19 +1407,19 @@ def newton(residual : ngs.BilinearForm | ngs.comp.SumOfIntegrals, # residual (wr
     if verbose >=2 :  print(f" Total wall time: {(time() - tStart) :.2f} s.")
 
     result = initial_state.copy()
-    result["info"]["status"] = status
-    result["info"]["linear_detected"] = linear
-    result["info"]["iteration"] = counter_newton
-    if counter_newton>0: result["info"]["K"] = residual.mat # no Kinv provided
-    result["info"]["Kinv"] = Kinv  
-    result["info"]["residual"] = residual_list
-    result["info"]["decrement"] = decrement_list
-    result["info"]["walltime"] = { "fes": None, 
-                                    "assembly": None, 
-                                    "decomposition": None, 
-                                    "rhs": None, 
-                                    "solve": None,
-                                    "total":time() - tStart}
+    result["info"]["solver"]["algorithm"]["convergence"]["status"] = status
+    result["info"]["solver"]["algorithm"]["convergence"]["linear_detected"] = linear
+    result["info"]["solver"]["algorithm"]["convergence"]["iteration"] = counter_newton
+    if counter_newton>0: result["info"]["solver"]["operators"]["K"] = residual.mat
+    result["info"]["solver"]["operators"]["Kinv"] = Kinv  
+    result["info"]["solver"]["algorithm"]["convergence"]["residual"] = residual_list
+    result["info"]["solver"]["algorithm"]["convergence"]["decrement"] = decrement_list
+    result["info"]["timing"] = { "fes": None, 
+                                 "assembly": None, 
+                                 "decomposition": None, 
+                                 "rhs": None, 
+                                 "solve": None,
+                                 "total": time() - tStart}
 
     if verbose >=2 : print(f" ********************* END NEWTON ********************* ")  
     return gfu2state(state, result)
@@ -1395,7 +1437,7 @@ def operator_magnetostatic(state : dict,
 
     """ Operator of symmetric magnetostatic formulation """
 
-    reluctivity = state["info"]["reluctivity"]
+    reluctivity = state["info"]["problem"]["reluctivity"]
     a_ = state["test"]["a"]
     a = state[type]["a"]
 
@@ -1422,9 +1464,9 @@ def rhs_magnetostatic(state : dict,
 
     """ Right-hand side of symmetric magnetostatic formulation """
 
-    magnetization = state["info"]["magnetization"]
-    conductivity = state["info"]["conductivity"]
-    I = state["info"]["supply"]
+    magnetization = state["info"]["problem"]["magnetization"]
+    conductivity = state["info"]["problem"]["conductivity"]
+    I = state["info"]["problem"]["supply"]
     bundles = I.keys()
     a_ = state["test"]["a"]
 
@@ -1528,43 +1570,54 @@ def init_magnetoquasistatic_state(fes: ngs.FESpace,  # finite element space
                     "trial": {"a": a, "E": None},
                     "test": {"a": a_, "E": None},
                     "bundles": bundles,
-                    # plan : add "solver", "problem" subcategories
                     "info": {
-                        "fes": fes,
-                        "reluctivity" : reluctivity_callable,
-                        "magnetization" : magnetization_callable,
-                        "frequency" : frequency,
-                        "supply" : supply_callable,
-                        "conductivity" : conductivity,
-                        "Kinv": None,
-                        "K" : None,
-                        "F" : None,
-                        "solver": solver,
-                        "bonus_intorder" : bonus_intorder,
-                        "verbose" : verbose, 
-                        "taskmanager" : taskmanager,
-                        "maxit_newton" : maxit_newton,
-                        "atol_decrement" : atol_decrement,
-                        "atol_residual" : atol_residual,
-                        "rtol_residual" : rtol_residual,
-                        "linesearch": linesearch,
-                        "maxit_linesearch" : maxit_linesearch,
-                        "minstep_linesearch": minstep_linesearch,
-                        "armijo_factor_linesearch" : armijo_factor_linesearch,
-                        "step_factor_linesearch" : step_factor_linesearch,
-                        "robin_bnd" : robin_bnd, 
-                        "robin_coeff" :robin_coeff, 
-                        "a_dirichlet" : a_dirichlet,
-                        "h_tangential" : h_tangential,
-                        "fix1dof" : fix1dof,
-                        "walltime" : {"fes": None, 
-                                    "assembly": None, 
-                                    "decomposition": None, 
-                                    "rhs": None, 
-                                    "solve": None,
-                                    "total":None}
+                        "problem": {
+                            "space": fes,
+                            "reluctivity": reluctivity_callable,
+                            "magnetization": magnetization_callable,
+                            "frequency": frequency,
+                            "supply": supply_callable,
+                            "conductivity": conductivity,
                         },
-                    }
+                        "robin": {
+                            "robin_bnd": robin_bnd,
+                            "robin_coeff": robin_coeff,
+                            "a_dirichlet": a_dirichlet,
+                            "h_tangential": h_tangential,
+                            "fix1dof": fix1dof,
+                        },
+                        "solver": {
+                            "library": solver,
+                            "assembly": {
+                                "bonus_intorder": bonus_intorder,
+                                "taskmanager": taskmanager,
+                                "verbose": verbose,
+                            },
+                            "algorithm": {
+                                "maxit_newton": maxit_newton,
+                                "atol_decrement": atol_decrement,
+                                "atol_residual": atol_residual,
+                                "rtol_residual": rtol_residual,
+                                "linesearch": linesearch,
+                                "maxit_linesearch": maxit_linesearch,
+                                "minstep_linesearch": minstep_linesearch,
+                                "armijo_factor_linesearch": armijo_factor_linesearch,
+                                "step_factor_linesearch": step_factor_linesearch,
+                            },
+                            "operators": {
+                                "Kinv": None,
+                                "K": None,
+                                "F": None,
+                            },
+                        },
+                        "timing": {"fes": None, 
+                                   "assembly": None, 
+                                   "decomposition": None, 
+                                   "rhs": None, 
+                                   "solve": None,
+                                   "total": None},
+                    },
+                }
     
     t2 = time()
     if verbose>=1: print(f"done ({1000*(t2 - t1):.0f} ms)")
@@ -1575,13 +1628,13 @@ def init_magnetoquasistatic_state(fes: ngs.FESpace,  # finite element space
     residual = operator_magnetostatic(init_state, type="trial",
                                       robin_bnd = robin_bnd,
                                       robin_coeff=robin_coeff,
-                                      bonus_intorder=init_state["info"]["bonus_intorder"]) \
+                                      bonus_intorder=init_state["info"]["solver"]["assembly"]["bonus_intorder"]) \
                 - rhs_magnetostatic(init_state, t = 0,
                                     robin_bnd=robin_bnd,
                                     robin_coeff= robin_coeff,
                                     a_dirichlet=a_dirichlet,
                                     h_tangential=h_tangential,
-                                    bonus_intorder=init_state["info"]["bonus_intorder"])
+                                    bonus_intorder=init_state["info"]["solver"]["assembly"]["bonus_intorder"])
     
     
     init_state = newton(residual = residual,
@@ -1626,7 +1679,7 @@ def init_magnetoquasistatic_state(fes: ngs.FESpace,  # finite element space
     E_ = {bundle: tests[i + 1] for i, bundle in enumerate(bundles)}   
     eSol = {bundle: solution.components[i + 1] for i, bundle in enumerate(bundles)}
 
-    init_state["info"]["fes"] = fes
+    init_state["info"]["problem"]["space"] = fes
     init_state["solution"]["a"] = aSol
     init_state["solution"]["E"] = eSol
     init_state["trial"]["a"] = a
@@ -1655,7 +1708,7 @@ def operator_magnetoquasistatic_time_domain(state : dict,
                                             )-> ngs.comp.SumOfIntegrals:
     """ Operator of symmetric magnetoquasistatic formulation """
 
-    bonus_intorder = state["info"]["bonus_intorder"]
+    bonus_intorder = state["info"]["solver"]["assembly"]["bonus_intorder"]
     K = 0
     # Magnetostatic part
     if theta >0:
@@ -1666,12 +1719,12 @@ def operator_magnetoquasistatic_time_domain(state : dict,
                                             robin_coeff = robin_coeff_New)
 
     # Eddy-current coupling in each bundle
-    conductivity = state["info"]["conductivity"]
+    conductivity = state["info"]["problem"]["conductivity"]
     E_ = state["test"]["E"]
     a_ = state["test"]["a"]
     ENew = state["trial"]["E"]
     aNew = state["trial"]["a"]
-    for bundle in state["info"]["supply"].keys():
+    for bundle in state["info"]["problem"]["supply"].keys():
         K += conductivity/dt * ( aNew  + theta * ENew[bundle]) * (a_ + E_[bundle]) * ngs.dx(bundle, bonus_intorder = bonus_intorder)
 
     return K.Compile() 
@@ -1696,10 +1749,10 @@ def rhs_magnetoquasistatic_time_domain(state : dict,
 
     """ Right-hand side of symmetric magnetoquasistatic formulation """
 
-    conductivity = state["info"]["conductivity"]
-    I = state["info"]["supply"]
+    conductivity = state["info"]["problem"]["conductivity"]
+    I = state["info"]["problem"]["supply"]
     bundles = I.keys()
-    bonus_intorder = state["info"]["bonus_intorder"]
+    bonus_intorder = state["info"]["solver"]["assembly"]["bonus_intorder"]
 
     E_ = state["test"]["E"]
     a_ = state["test"]["a"]
@@ -1810,7 +1863,7 @@ def  solve_magnetoquasistatic_time_domain(fes: ngs.FESpace,  # finite element sp
 
     state_list = [copy_state(init_state)]
     if draw:
-        scene = ngs.webgui.Draw(state_list[-1]["solution"]["a"], init_state["info"]["fes"].mesh)
+        scene = ngs.webgui.Draw(state_list[-1]["solution"]["a"], init_state["info"]["problem"]["space"].mesh)
 
     if type(robin_coeff) != list: robin_coeff = [robin_coeff] * len(time_list)
     if len(robin_coeff) == 1: robin_coeff = robin_coeff * len(time_list)
@@ -1908,17 +1961,17 @@ def  solve_magnetoquasistatic_time_domain(fes: ngs.FESpace,  # finite element sp
             state_list[-1] = gfu2state(state_scaled, state_list[-1])
             
         if draw:
-            scene.Redraw(state_list[-1]["solution"]["a"], init_state["info"]["fes"].mesh)
+            scene.Redraw(state_list[-1]["solution"]["a"], init_state["info"]["problem"]["space"].mesh)
         
         state_list[-1]["time"] = t + dt
 
         if verbose>=1 : 
-            status = state_list[-1]["info"]["status"]
+            status = state_list[-1]["info"]["solver"]["algorithm"]["convergence"]["status"]
             if status : print(f"Newton failed (error code: {status})")
-            elif state_list[-1]["info"]["iteration"] == 1:
-                print(f"Newton succeeded (1 iteration, {state_list[-1]["info"]["walltime"]["total"]:.2} s)")
+            elif state_list[-1]["info"]["solver"]["algorithm"]["convergence"]["iteration"] == 1:
+                print(f"Newton succeeded (1 iteration, {state_list[-1]['info']['timing']['total']:.2} s)")
             else:
-                print(f"Newton succeeded ({state_list[-1]["info"]["iteration"]} iterations, {state_list[-1]["info"]["walltime"]["total"]:.2} s)")
+                print(f"Newton succeeded ({state_list[-1]['info']['solver']['algorithm']['convergence']['iteration']} iterations, {state_list[-1]['info']['timing']['total']:.2} s)")
 
     return state_list
 
@@ -2014,12 +2067,12 @@ def electric_field(results: dict,              # result of solve_magnetoharmonic
       and avoid division by zero.
     """
 
-    jw = 1j * 2 * ngs.pi * results["info"]["frequency"]
+    jw = 1j * 2 * ngs.pi * results["info"]["problem"]["frequency"]
 
     # Time-harmonic contribution from magnetic vector potential
     electric_field = -jw * results[type]["a"]
 
-    mesh = results["info"]["fes"].mesh
+    mesh = results["info"]["problem"]["space"].mesh
 
     # Add bundle electric potential contributions
     for bundle in results[type]["E"].keys():
@@ -2027,7 +2080,7 @@ def electric_field(results: dict,              # result of solve_magnetoharmonic
         electric_field += -jw * E * mesh.MaterialCF({bundle: 1})
 
     # Apply conductivity mask (avoid division by zero)
-    sigma = results["info"]["conductivity"]
+    sigma = results["info"]["problem"]["conductivity"]
 
     return electric_field * sigma / (sigma + 1e-300)
 
@@ -2066,11 +2119,11 @@ def electric_field_eddy_current(results: dict,              # result of solve_ma
       and avoid division by zero.
     """
 
-    jw = 1j * 2 * ngs.pi * results["info"]["frequency"]
+    jw = 1j * 2 * ngs.pi * results["info"]["problem"]["frequency"]
 
     # Time-harmonic contribution from magnetic vector potential
 
-    mesh = results["info"]["fes"].mesh
+    mesh = results["info"]["problem"]["space"].mesh
     E_eddy_current = -jw * results[type]["a"]
 
     # Add bundle electric potential contributions
@@ -2078,7 +2131,7 @@ def electric_field_eddy_current(results: dict,              # result of solve_ma
         E = results[type]["E"][bundle]
         E_eddy_current += -jw * E* mesh.MaterialCF({bundle: 1})
 
-    sigma = results["info"]["conductivity"]
+    sigma = results["info"]["problem"]["conductivity"]
 
     return E_eddy_current * sigma / (sigma + 1e-300)
 
@@ -2121,13 +2174,13 @@ def electric_field2(results: dict,              # result of solve_magnetoharmoni
     else:
         E += E_eddy
 
-    mesh = results["info"]["fes"].mesh
-    sigma = results["info"]["conductivity"]
+    mesh = results["info"]["problem"]["space"].mesh
+    sigma = results["info"]["problem"]["conductivity"]
 
     # Add DC contributions
     if  type.lower() == "solution":
         for bundle in results[type]["E"].keys():
-            I = results["info"]["supply"][bundle]
+            I = results["info"]["problem"]["supply"][bundle]
             rho_avg = 1/integrate(sigma, results, bundle)
             E += rho_avg * I  * mesh.MaterialCF({bundle: 1}) 
 
@@ -2159,7 +2212,7 @@ def current_density(results: dict,          # result of solve_magnetoharmonic
         Complex current density field J = σ E (local Ohm's law)
     """
 
-    sigma = results["info"]["conductivity"]
+    sigma = results["info"]["problem"]["conductivity"]
 
     return sigma * electric_field(results, type)
 
@@ -2189,7 +2242,7 @@ def current_density2(results: dict,          # result of solve_magnetoharmonic
         Complex current density field J = σ E (local Ohm's law)
     """
 
-    sigma = results["info"]["conductivity"]
+    sigma = results["info"]["problem"]["conductivity"]
 
     return sigma * electric_field2(results, type)
 
@@ -2227,7 +2280,7 @@ def joule_losses(results : dict,
     j = current_density(results)
 
     # Conductivity with numerical safety offset
-    sigma = results["info"]["conductivity"] + 1e-300
+    sigma = results["info"]["problem"]["conductivity"] + 1e-300
 
     # Time-averaged Joule losses: 1/2 ∫ |J|^2 / σ dx
     p = ngs.InnerProduct(j, j).real / sigma
@@ -2262,7 +2315,7 @@ def joule_losses2(results : dict,
         P = 1/2 ∫_Ω (|J|² / σ) dx
       We integrate on each bundle separating DC and AC losses.
     """
-    sigma = results["info"]["conductivity"] + 1e-300
+    sigma = results["info"]["problem"]["conductivity"] + 1e-300
 
     E =  electric_field_eddy_current(results = results)
     E.Compile()
@@ -2281,7 +2334,7 @@ def joule_losses2(results : dict,
     # =  0 because avg( conj(J_hf)) ) = conj( avg( J_hf ) ) = 0 over the bundle
     # therefore, only Pbf = int(|Jbf|² / 2σ) and  |Jhf|² = int(|Jhf|² / 2σ) have to be computed
 
-    I = results["info"]["supply"]
+    I = results["info"]["problem"]["supply"]
     for bundle in results["bundles"]:
         if match(zone, bundle):
             intSigma = integrate(sigma, results, bundle)
@@ -2361,7 +2414,7 @@ def average_torque(results : dict,
     # Quadrature order adapted to FE polynomial degree
     order = 2 * results["solution"]["a"].space.globalorder + 1
 
-    mesh = results["info"]["fes"].mesh
+    mesh = results["info"]["problem"]["space"].mesh
 
     # Airgap normalization area
     S = surface(airgap, mesh)

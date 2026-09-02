@@ -425,7 +425,7 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
     Notes
     -----
     - The adjoint system is solved using the precomputed inverse operator
-      stored in `results["info"]["Kinv"]`.
+      stored in `results["info"]["solver"]["operators"]["Kinv"]`.
     - Complex and real-valued systems are handled separately via Hermitian
       or transpose operators.
     """
@@ -452,7 +452,7 @@ def solve_adjoint(results   : dict,    # structured output from physics.solve_ma
 
     # Retrieve precomputed inverse system operator
     if verbose >= 1: print("Solving adjoint system... ", end = "")
-    Kinv = results["info"]["Kinv"]
+    Kinv = results["info"]["solver"]["operators"]["Kinv"]
 
     # Solve adjoint system (complex vs real handling)
     if sol.is_complex:
@@ -537,12 +537,12 @@ def dd_joule_losses(results : dict,
     """
 
     # Electrical conductivity
-    sigma = results["info"]["conductivity"]
+    sigma = results["info"]["problem"]["conductivity"]
 
     expr = 0
     a = results["solution"]["a"]
     a_ = results["test"]["a"]
-    jw = 1j * 2 * ngs.pi * results["info"]["frequency"]
+    jw = 1j * 2 * ngs.pi * results["info"]["problem"]["frequency"]
     for bundle in results["bundles"]:
         if match(slot, bundle):
             e = results["solution"]["E"][bundle]
@@ -597,15 +597,15 @@ def dd_joule_losses2(results : dict,
     - The result is expressed as a finite-element integral form.
     """
     # Electrical conductivity
-    sigma = results["info"]["conductivity"] + 1e-300
+    sigma = results["info"]["problem"]["conductivity"] + 1e-300
 
     # Returns the directional derivative of losses w.r.t the state
     expr = 0
 
     a = results["solution"]["a"]
     a_ = results["test"]["a"]
-    I = results["info"]["supply"]
-    jw = 1j * 2 * ngs.pi * results["info"]["frequency"]
+    I = results["info"]["problem"]["supply"]
+    jw = 1j * 2 * ngs.pi * results["info"]["problem"]["frequency"]
     for bundle in results["bundles"]:
         if match(slot, bundle):
             e = results["solution"]["E"][bundle]
@@ -763,17 +763,17 @@ def partiald_joule_losses2(results :     dict,
     # Initialize weak form
     expr = 0
 
-    #mesh = results["info"]["fes"].mesh
-    #supply = results["info"]["supply"]
-    #sigma = results["info"]["conductivity"]
+    #mesh = results["info"]["problem"]["space"].mesh
+    #supply = results["info"]["problem"]["supply"]
+    #sigma = results["info"]["problem"]["conductivity"]
 
     if wrt.lower() == "conductivity":
 
         # Electric field from primal solution
         E_eddy = electric_field_eddy_current(results)
         E_total = electric_field2(results, E_eddy=E_eddy)
-        I = results["info"]["supply"]
-        sigma = results["info"]["conductivity"]
+        I = results["info"]["problem"]["supply"]
+        sigma = results["info"]["problem"]["conductivity"]
 
         # Adjoint component from magnetic vector potential
         pa = adjoint["solution"]["a"]
