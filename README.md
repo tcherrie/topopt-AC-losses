@@ -85,7 +85,18 @@ Execute one of the notebooks in your favorite IDE within your newly created `mye
 └── LICENSE # GNU LGPL 2.1 or any later version
 ```
 
-## 5) License
+## 5) AI Use Statement
+
+This codebase was developed with assistance from AI tools:
+
+- **Théodore CHERRIERE** wrote the initial code and is responsible for its content, design, and any errors.
+- **ChatGPT (OpenAI, free tier)** was used to help generate docstrings and assist with code structuring. All AI-generated content was carefully reviewed, post-edited, and finalized by the authors.
+- **Cline (AI coding agent)** assisted with code review, refactoring, and documentation improvements.
+- All AI contributions are considered auxiliary; the authors take full responsibility for the code's correctness and integrity.
+
+This software is provided "as is" without warranty of any kind, and can be used, shared and modified under the terms of the GNU LGPL license.
+
+## 6) License
 
 Copyright (C) Théodore CHERRIERE (theodore.cherriere@centralesupelec.fr), Alexis PONS (alexis.pons@centralesupelec.fr), Guillaume KREBS (guillaume.krebs@centralesupelec.fr), Adrien MERCIER (adrien.mercier@centralesupelec.fr), Loucif BENMAMAS (loucif.benmamas@safrangroup.com), Sulivan KÜTTLER (sulivan.kuttler@safrangroup.com)
 

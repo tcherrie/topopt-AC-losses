@@ -5,15 +5,10 @@ Provide utilities to generate the machine geometry and mesh.
 Functions defined here:
 - plot_points               (debug)
 - plot_lines                (debug)
-- mask                      (helper for vizualization)
+- mask                      (helper for visualization)
 - find_tangent_intersection (helper)
 - machine_mesh              (main function)
 - slot_mesh                 (main function)
-
-A Large Language Model (GPT-5.5 from Open AI, free version) was used to help with the code and generate
-the docstrings of the functions. The authors have written the initial code, carefully checked and post-edited
-the content of this file, and take full responsability of its content.
-This software is provided "as is" without warranty of any kind, and can be used, shared ad modified under the terms of GNU LGPL license.
 """
 
 #%% Metadata

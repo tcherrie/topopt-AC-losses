@@ -1,6 +1,6 @@
 """Linear algebra utilities
 
-Provide utilities related to linear algebra
+Provide utilities related to linear algebra.
 
 Functions defined here:
 - L2norm
@@ -9,12 +9,6 @@ Functions defined here:
 - vec
 - split_mat
 - split_vec
-
-
-A Large Language Model (GPT-5.5 from Open AI, free version) was used to help with the code and generate
-the docstrings of the functions. The authors have written the initial code, carefully checked and post-edited
-the content of this file, and take full responsability of its content.
-This software is provided "as is" without warranty of any kind, and can be used, shared ad modified under the terms of GNU LGPL license.
 """
 
 #%% Metadata

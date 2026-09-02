@@ -11,12 +11,6 @@ Functions defined here:
 - dd_joule_losses       (gradient computation)
 - partiald_joule_losses (gradient computation)
 - d_joule_losses        (gradient computation)
-
-
-A Large Language Model (GPT-5.5 from Open AI, free version) was used to help with the code and generate
-the docstrings of the functions. The authors have written the initial code, carefully checked and post-edited
-the content of this file, and take full responsability of its content.
-This software is provided "as is" without warranty of any kind, and can be used, shared ad modified under the terms of GNU LGPL license.
 """
 
 #%% Metadata
